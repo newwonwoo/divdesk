@@ -1,0 +1,9 @@
+{
+  "name": "DivDesk 배당ETF 매수검토기",
+  "short_name": "DivDesk",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#E9EDF2",
+  "theme_color": "#0F1E3D",
+  "icons": []
+}

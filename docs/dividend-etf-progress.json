@@ -1,0 +1,191 @@
+{
+  "app_name": "DivDesk (배당ETF 매수검토기)",
+  "saved_at": "2026-08-01 (2차 과제까지 완료)",
+  "current_stage": "전 기능 구현 완료 — 배포 및 운용사 공시 대조만 남음",
+  "tech_stack": [
+    "React",
+    "Vite",
+    "Vercel",
+    "Python FastAPI (EC2)",
+    "PostgreSQL",
+    "yfinance",
+    "cron"
+  ],
+  "design": {
+    "components": [
+      "Dashboard",
+      "Calculator.Forward",
+      "Calculator.Reverse",
+      "Screener",
+      "EtfDetail",
+      "Calendar",
+      "Ledger",
+      "Alerts",
+      "Settings",
+      "InfoButton(공통)"
+    ],
+    "data_flow": "EC2 cron -> yfinance 수집 -> Postgres(etf_master/price/dividend/fx) -> 스코어 배치(score_snapshot) -> FastAPI -> React. 매수기록은 React -> FastAPI -> purchase 테이블.",
+    "apis": [
+      "yfinance",
+      "운용사 공식 배당스케줄(PDF/웹)",
+      "USDKRW",
+      "웹서치(20종목 외 온디맨드)",
+      "공공데이터포털 금융위 ETF시세정보",
+      "SEIBro 배당정보"
+    ],
+    "engines": [
+      "정방향: 투자금 -> 세후 월배당",
+      "역방향: 목표 월배당 -> 필요 투자금/주수",
+      "매수타점 스코어 0~100 (배당률백분위30/가격위치20/분배금건강20/총수익정합10/환율10/배당락10)"
+    ],
+    "tax_modes": [
+      "A 일반계좌+미국상장(15% 원천징수, 2000만 종합과세, 양도 22% 분리)",
+      "B 일반계좌+국내상장(15.4%, 매매차익도 배당과세, 2025 선환급 폐지)",
+      "C 절세계좌(ISA/연금, 과세이연·저율)"
+    ],
+    "universe_count": 31,
+    "mockup": "divdesk-mockup.html"
+  },
+  "coding_list": [
+    {
+      "id": 1,
+      "task": "Postgres 스키마 + tax_param 시딩",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 2,
+      "task": "소스 어댑터 레이어 + 계약검증 + raw_snapshot",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 3,
+      "task": "수집기 A 미국 — 야후 + stockanalysis 교차검증",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 4,
+      "task": "수집기 B 국내 — 야후 .KS 경유 (네이버 불필요)",
+      "level": "어려움",
+      "done": true
+    },
+    {
+      "id": 5,
+      "task": "국내 분배금 이력 + 지급주기 데이터 도출",
+      "level": "어려움",
+      "done": true
+    },
+    {
+      "id": 6,
+      "task": "FastAPI 골격 + 조회 API",
+      "level": "쉬움",
+      "done": true
+    },
+    {
+      "id": 7,
+      "task": "세금 엔진 3모드 + 단위테스트",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 8,
+      "task": "정방향 계산 API",
+      "level": "쉬움",
+      "done": true
+    },
+    {
+      "id": 9,
+      "task": "역방향 계산 API 정수 주수 루프",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 10,
+      "task": "스코어 엔진 배치 + 근거문장",
+      "level": "어려움",
+      "done": true
+    },
+    {
+      "id": 11,
+      "task": "React 골격 목업 컴포넌트화",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 12,
+      "task": "계산기 화면 연동",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 13,
+      "task": "타점 화면 연동 + 커버드콜 배지",
+      "level": "쉬움",
+      "done": true
+    },
+    {
+      "id": 14,
+      "task": "매수기록 CRUD",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 15,
+      "task": "금융소득 워치독",
+      "level": "쉬움",
+      "done": true
+    },
+    {
+      "id": 16,
+      "task": "12개월 입금 스트립",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 17,
+      "task": "배당예상일지 캘린더 (거래일 시세에서 휴장일 도출)",
+      "level": "어려움",
+      "done": true
+    },
+    {
+      "id": 18,
+      "task": "수정종가 기반 정확한 총수익률",
+      "level": "보통",
+      "done": true
+    },
+    {
+      "id": 19,
+      "task": "웹푸시 SW+VAPID+알람 배치 (상향돌파 전이 감지)",
+      "level": "어려움",
+      "done": true
+    }
+  ],
+  "open_questions": [
+    "대상시장 범위",
+    "알림 채널",
+    "Postgres 위치",
+    "MVP 범위",
+    "보유종목 시딩"
+  ],
+  "memo": "전 기능 완료. 결함 10건 발견·수정. 공휴일 표 대신 시세 날짜에서 거래일 도출 (한국 10일·미국 7일 정확 도출). 총수익률은 수정종가 비율. 알람은 임계 상향돌파 전이만 발송+14일 쿨다운. 품질확인서 docs/QUALITY-MVP.md",
+  "decisions": {
+    "scope": "미국상장+국내상장 둘 다, 절세계좌 비교 포함",
+    "alert_channel": "웹푸시(PWA)",
+    "mvp": "계산기+타점스코어+매수기록",
+    "db": "EC2 로컬 PostgreSQL"
+  },
+  "phase2": [
+    "운용사 공시로 국내 명칭·지수·보수 대조 (사람 확인 필요)",
+    "API 인증",
+    "미래 배당 확정 공시 파싱"
+  ],
+  "verified_sources": {
+    "yahoo_chart": "미국 21/21 + 국내 10/10 실측 OK, 무인증",
+    "stockanalysis": "미국 교차검증 200 OK",
+    "naver_kr": "priority 60 선택적 교차검증으로 격하 — 미검증",
+    "dividendhistory.net": "503 제외",
+    "data.krx.co.kr": "403 제외"
+  }
+}
