@@ -34,16 +34,20 @@ async function req(path, options = {}) {
 export const api = {
   health: () => req('/health'),
   etfs: (market) => req('/etfs' + (market ? `?market=${market}` : '')),
+  duplicates: () => req('/etfs/duplicates'),
+  projection: (p) => req('/projection', { method: 'POST', body: JSON.stringify(p) }),
+  syncToss: () => req('/sync/toss', { method: 'POST' }),
+  reconcile: () => req('/reconcile?account_mode=US_TAXABLE'),
   scores: () => req('/scores'),
   forward: (payload) => req('/calc/forward', { method: 'POST', body: JSON.stringify(payload) }),
   reverse: (payload) => req('/calc/reverse', { method: 'POST', body: JSON.stringify(payload) }),
   purchases: () => req('/purchases'),
   addPurchase: (p) => req('/purchases', { method: 'POST', body: JSON.stringify(p) }),
   delPurchase: (id) => req(`/purchases/${id}`, { method: 'DELETE' }),
-  portfolio: (mode) => req(`/portfolio?account_mode=${mode}`),
-  returns: (mode) => req(`/portfolio/returns?account_mode=${mode}`),
+  portfolio: (mode = 'ALL') => req(`/portfolio?account_mode=${mode}`),
+  returns: (mode = 'ALL') => req(`/portfolio/returns?account_mode=${mode}`),
   watchdog: () => req('/watchdog'),
-  calendar: (mode) => req(`/calendar?account_mode=${mode}`),
+  calendar: (mode = 'ALL') => req(`/calendar?account_mode=${mode}`),
   holidays: (market, year) => req(`/calendar/holidays?market=${market}&year=${year}`),
   pushKey: () => req('/push/key'),
   pushTest: () => req('/push/test', { method: 'POST' }),
@@ -51,14 +55,7 @@ export const api = {
   syncStatus: () => req('/sync/status'),
 }
 
-export const won = (n) =>
-  n == null || Number.isNaN(n) ? '—' : Math.round(n).toLocaleString('ko-KR')
-
-export const MODES = [
-  { key: 'US_TAXABLE', label: '일반·미국상장' },
-  { key: 'KR_TAXABLE', label: '일반·국내상장' },
-  { key: 'KR_SHELTER', label: '절세계좌' },
-]
+export { won, MODES } from './format.js'
 
 // ⓘ 버튼이 여는 설명. "간결하되 추가설명은 버튼으로" 요구사항의 실체.
 export const DOC = {
@@ -118,6 +115,35 @@ export const DOC = {
         평균 환율을 쓰면 환차익이 틀어집니다.</p>
       <p>시세차익·환차익은 아직 팔지 않은 평가손익이라 세금이 붙지 않았습니다.
         "지금 전부 팔면" 예상 세금은 따로 표시합니다.</p>
+    </>],
+  proj: ['적립 시뮬레이션은 어떻게 계산하나요',
+    <>
+      <p>과거 실제 시세 위에서 <b>시작 시점을 한 달씩 옮겨가며 전부 돌린 결과</b>입니다.
+        평균 수익률로 복리를 굴려 하나의 숫자를 내는 방식은 쓰지 않습니다 —
+        언제 시작했느냐로 결과가 크게 갈리기 때문입니다.</p>
+      <p>그래서 <b>중간값·최악·최선</b>을 함께 보여줍니다. 중간값이 가장 그럴듯한 값이고,
+        최악은 가장 나쁜 시점에 시작했을 때입니다.</p>
+      <p>수정종가를 쓰므로 <b>배당 재투자와 복리가 이미 반영</b>돼 있습니다.
+        배당을 따로 더할 필요가 없습니다.</p>
+      <p><b>달러 기준</b>으로 계산합니다. 10년 뒤 환율은 알 수 없고, 과거 환율로 굴리면
+        환율 추세가 섞여 종목 비교가 흐려집니다. 원화는 현재 환율을 곱한 참고값입니다.</p>
+      <p>상장일이 다른 종목은 <b>공통 구간</b>에 맞춰 계산합니다. 오래된 종목만
+        과거 폭락장을 겪은 것으로 나오면 비교가 왜곡되기 때문입니다.</p>
+    </>],
+  dup: ['같은 지수를 추종하는 종목',
+    <>
+      <p>같은 지수를 따라가는 ETF를 여러 개 담아도 분산 효과가 없습니다. 내용물이 같으니까요.</p>
+      <p>고르는 기준은 배당률이 아니라 <b>총보수와 순자산</b>입니다. 배당률 차이는
+        조회 시점의 주가 차이일 뿐이고, 보수는 매년 확정적으로 나갑니다.</p>
+      <p>보수 차이가 0.02%p 이내면 사실상 같다고 봅니다. 1억원에 연 2만원 차이인데,
+        그것 때문에 순자산이 훨씬 작은 종목을 고르면 매매할 때 호가 손실이 더 큽니다.</p>
+    </>],
+  recon: ['잔고 대조',
+    <>
+      <p>이 앱에 쌓인 매수기록의 합계와 증권사의 실제 보유수량을 맞춰봅니다.</p>
+      <p><b>지금은 매도를 반영하지 않습니다.</b> 팔았는데 기록에 남아 있으면
+        보유수량과 수익이 실제보다 크게 나오므로, 차이를 여기서 잡아냅니다.</p>
+      <p>액면분할이나 무상증자처럼 주문 없이 수량이 바뀌는 경우도 여기 걸립니다.</p>
     </>],
   cal: ['배당예상일지는 어떻게 만드나요',
     <>
