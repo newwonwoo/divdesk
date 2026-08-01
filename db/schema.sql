@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS etf_master (
   index_name      text,
   kr_alt_ticker   text,                        -- 절세계좌 대체종목 매핑
   is_covered_call boolean DEFAULT false,       -- '분배금 ≠ 수익' 배지 강제
+  is_benchmark    boolean DEFAULT false,       -- 비교 기준. 매수 후보·타점 목록에서 제외
   tags            jsonb DEFAULT '{}'::jsonb,
   updated_at      timestamptz DEFAULT now()
 );

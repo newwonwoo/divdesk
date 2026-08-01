@@ -22,7 +22,10 @@ from .sources.yahoo import YahooAdapter
 from .store import Store
 
 # 종목: (티커, 지급주기 횟수, 커버드콜 여부)
-UNIVERSE = [
+# 벤치마크. 매수 후보는 아니지만 비교하려면 같은 데이터가 필요하다.
+BENCHMARKS = [("SPY", 4, False), ("VOO", 4, False), ("QQQ", 4, False)]
+
+UNIVERSE = BENCHMARKS + [
     ("SCHD", 4, False), ("VYM", 4, False), ("VIG", 4, False), ("DGRO", 4, False),
     ("DVY", 4, False), ("SDY", 4, False), ("NOBL", 4, False), ("HDV", 4, False),
     ("FDVV", 4, False), ("SCHY", 4, False), ("VYMI", 4, False), ("VNQ", 4, False),
@@ -47,12 +50,24 @@ def collect_one(ticker: str, pays: int, primary, checker, store: Store) -> dict:
     except Exception as exc:                                  # noqa: BLE001
         notes.append(f"교차검증 건너뜀({type(exc).__name__})")
 
-    # 200일선·52주 고저를 만들려면 과거 시계열이 필요하다.
+    # 200일선·52주 고저에는 일봉이 필요하고, 장기 적립 시뮬레이션에는
+    # 10년보다 긴 이력이 필요하다. 야후는 range=max 를 주면 일봉이 아니라
+    # 월봉을 돌려주므로, 최근은 일봉(10년) + 과거는 월봉(상장 이후)으로 합친다.
     stats: dict = {}
     try:
-        stats = store.upsert_history(ticker, primary.fetch_history(ticker), primary.name)
-        if stats and stats.get("ma200") is None:
-            notes.append(f"거래일 {stats['days']}일치뿐 — 200일선 없음(가격 위치 항목 중립 처리)")
+        daily = primary.fetch_history(ticker, rng="10y")
+        merged = dict()
+        try:
+            for row in primary.fetch_history(ticker, rng="max"):
+                merged[row[0]] = row              # 월봉 먼저
+        except Exception:                                     # noqa: BLE001
+            notes.append("장기 월봉 수집 실패 — 최근 10년만 저장")
+        for row in daily:
+            merged[row[0]] = row                  # 겹치면 일봉이 이긴다
+        series = sorted(merged.values())
+        stats = store.upsert_history(ticker, series, primary.name)
+        if stats.get("ma200") is None:
+            notes.append(f"거래일 {stats.get('days')}일치뿐 — 200일선 없음(가격 위치 항목 중립 처리)")
     except Exception as exc:                                  # noqa: BLE001
         notes.append(f"시계열 수집 실패({type(exc).__name__}) — 종가만 저장")
         store.upsert_quote(quote)
@@ -106,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # 환율은 '지금 값'만으로는 부족하다. 스코어의 환율 항목이 3년 밴드 백분위를
         # 쓰기 때문에 시계열을 함께 채운다.
-        history = primary.fetch_history("USDKRW=X", rng="3y")
+        history = primary.fetch_history("USDKRW=X", rng="5y")
         for row in history:
             store.upsert_fx(row[1], row[0], primary.name)
         rate, day = primary.fetch_usdkrw()

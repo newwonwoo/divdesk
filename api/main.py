@@ -22,6 +22,9 @@ from engine.calc import ALLOC_EQUAL, Holding, forward, reverse
 from engine.calendar import (TradingCalendar, monthly_ledger, next_ex_date,
                              predict_schedule)
 from engine.score import ScoreInput, score
+from engine.projection import common_start
+from engine.projection import compare as compare_projections
+from engine.projection import growth_quality, simulate
 from engine.returns import Lot, portfolio_return, position_return
 from engine.tax import MODES, TaxEngine
 from alerts import push
@@ -159,17 +162,18 @@ def health():
 @app.get("/etfs")
 def list_etfs(market: str | None = None):
     sql = """SELECT m.ticker, m.name, m.market, m.strategy, m.pay_freq,
-                    m.expense_ratio, m.is_covered_call, m.kr_alt_ticker,
+                    m.expense_ratio, m.is_covered_call, m.is_benchmark, m.kr_alt_ticker,
                     p.close, p.date AS price_date,
                     s.total AS score, s.reason
              FROM etf_master m
              LEFT JOIN LATERAL (SELECT close,date FROM etf_price_daily
                                 WHERE ticker=m.ticker ORDER BY date DESC LIMIT 1) p ON true
              LEFT JOIN LATERAL (SELECT total,reason FROM score_snapshot
-                                WHERE ticker=m.ticker ORDER BY date DESC LIMIT 1) s ON true"""
+                                WHERE ticker=m.ticker ORDER BY date DESC LIMIT 1) s ON true
+             WHERE m.is_benchmark = false"""
     params: tuple = ()
     if market:
-        sql += " WHERE m.market=%s"
+        sql += " AND m.market=%s"
         params = (market.upper(),)
     return {"items": rows(sql + " ORDER BY s.total DESC NULLS LAST", params)}
 
@@ -183,7 +187,8 @@ def duplicate_index():
     """
     groups: dict = {}
     for row in rows("""SELECT ticker, name, market, expense_ratio,
-                              (tags->>'aum_eok')::numeric AS aum_eok,
+                              COALESCE((tags->>'aum_eok')::numeric,
+                                       (tags->>'aum_busd')::numeric) AS aum_eok,
                               tags->>'listed' AS listed,
                               tags->>'index' AS idx
                        FROM etf_master WHERE tags->>'index' IS NOT NULL"""):
@@ -521,6 +526,114 @@ def portfolio_returns(account_mode: str = "US_TAXABLE"):
 
     result = portfolio_return(positions, account_mode, engine(), ytd_income())
     return {"fx": fx, "fx_date": fx_date, "result": result, "no_price": missing}
+
+
+def adj_series(ticker: str) -> list:
+    return [(r["date"], r["adj_close"]) for r in rows(
+        """SELECT date, adj_close FROM etf_price_daily
+           WHERE ticker=%s AND adj_close IS NOT NULL ORDER BY date""", (ticker,))]
+
+
+class ProjectionReq(BaseModel):
+    monthly_krw: float = Field(gt=0)
+    years: int = Field(gt=0, le=30)
+    tickers: list[str]
+    with_benchmark: bool = True
+
+
+@app.post("/projection")
+def projection(req: ProjectionReq):
+    """매달 얼마씩 몇 년 넣으면 얼마가 되는지. 단일 값이 아니라 범위로 답한다."""
+    targets = list(dict.fromkeys(req.tickers))
+    benchmarks = []
+    if req.with_benchmark:
+        benchmarks = [r["ticker"] for r in rows(
+            "SELECT ticker FROM etf_master WHERE is_benchmark ORDER BY ticker")]
+        targets += [b for b in benchmarks if b not in targets]
+
+    series_map, missing = {}, []
+    for ticker in targets:
+        series = adj_series(ticker)
+        if series:
+            series_map[ticker] = series
+        else:
+            missing.append(ticker)
+
+    # 종목마다 상장일이 다르다. 각자의 전체 이력으로 돌리면 오래된 종목만
+    # 과거 폭락장을 겪은 것으로 나와 비교가 왜곡되므로 공통 구간으로 자른다.
+    # 다만 이력이 짧은 종목 하나 때문에 전체가 막히면 안 되니, 요청 기간을
+    # 못 채우는 종목은 공통 구간 계산에서 빼고 따로 알린다.
+    need_months = req.years * 12 + 1
+    eligible, too_short = {}, []
+    for ticker, series in series_map.items():
+        months = len({(d.year, d.month) for d, _ in series})
+        if months >= need_months:
+            eligible[ticker] = series
+        else:
+            too_short.append(ticker)
+    if not eligible:
+        raise HTTPException(
+            422, f"{req.years}년을 시뮬레이션할 만큼 이력이 긴 종목이 없습니다. "
+                 f"기간을 줄여보세요.")
+
+    since = common_start(eligible)
+    results = []
+    for ticker, series in eligible.items():
+        try:
+            results.append(simulate(ticker, series, req.monthly_krw,
+                                    req.years, since=since))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    if not results:
+        raise HTTPException(422, f"수정종가 데이터가 없습니다: {', '.join(missing)}")
+
+    payload = compare_projections(results)
+    return {
+        "monthly_krw": req.monthly_krw, "years": req.years,
+        "total_invested_krw": round(req.monthly_krw * req.years * 12),
+        "benchmarks": benchmarks, "no_data": missing,
+        "common_start": since,
+        "excluded_short_history": too_short,
+        "period_note": ("모든 종목을 공통 보유 구간으로 맞춰 계산했습니다. "
+                        "상장일이 다른 종목을 각자의 전체 이력으로 비교하면 "
+                        "오래된 종목만 과거 폭락장을 겪은 것으로 나와 왜곡됩니다."
+                        + (f" 상장이 늦어 제외한 종목: {', '.join(too_short)}"
+                           if too_short else "")),
+        "results": [{
+            "ticker": p.ticker, "is_benchmark": p.ticker in benchmarks,
+            "windows": p.windows,
+            "median_final_krw": p.median_final_krw,
+            "median_profit_krw": p.median_profit_krw,
+            "median_return_pct": p.median_return_pct,
+            "median_annual_pct": p.median_annual_pct,
+            "worst_final_krw": round(p.worst.final_value) if p.worst else None,
+            "best_final_krw": round(p.best.final_value) if p.best else None,
+            "worst_start": p.worst.start if p.worst else None,
+            "loss_windows": p.loss_windows,
+            "notes": p.notes,
+        } for p in payload.get("items", results)],
+        "spread_krw": payload.get("spread_krw"),
+    }
+
+
+@app.get("/etfs/{ticker}/quality")
+def quality(ticker: str, years: int = 5):
+    """꾸준히 올랐는지. 배당만 보고 고르면 주가가 빠지는 종목을 사게 된다."""
+    meta = rows("SELECT name, is_covered_call FROM etf_master WHERE ticker=%s", (ticker,))
+    if not meta:
+        raise HTTPException(404, f"{ticker} 를 찾을 수 없습니다")
+    stat = growth_quality(adj_series(ticker), years)
+    bench = {b["ticker"]: growth_quality(adj_series(b["ticker"]), years)
+             for b in rows("SELECT ticker FROM etf_master WHERE is_benchmark")}
+    gap = None
+    spy = bench.get("SPY")
+    if stat.get("available") and spy and spy.get("available"):
+        gap = round(stat["cagr_pct"] - spy["cagr_pct"], 2)
+    return {"ticker": ticker, "name": meta[0]["name"], "quality": stat,
+            "benchmarks": bench, "vs_spy_pp": gap,
+            "note": ("연평균 총수익이 SPY보다 낮다면, 배당을 받아도 시장을 그냥 사는 것보다 "
+                     "못한 결과입니다." if gap is not None and gap < 0 else None)}
 
 
 # ---------- 푸시 알림 ----------

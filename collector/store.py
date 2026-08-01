@@ -62,9 +62,16 @@ class Store:
         series = sorted(series)
         # (날짜, 종가) 또는 (날짜, 종가, 수정종가) 둘 다 받는다
         series = [(row[0], row[1], row[2] if len(row) > 2 else None) for row in series]
-        closes = [c for _, c, _ in series]
-        ma200 = round(sum(closes[-200:]) / 200, 4) if len(closes) >= 200 else None
-        window = closes[-252:] if len(closes) >= 252 else None
+        # 과거 월봉이 섞여 있을 수 있으므로, 지표는 '연속된 일봉 구간'에서만 낸다.
+        # 직전 관측과 7일 넘게 벌어진 지점 이후를 일봉으로 본다.
+        daily_start = 0
+        for i in range(len(series) - 1, 0, -1):
+            if (series[i][0] - series[i - 1][0]).days > 7:
+                daily_start = i
+                break
+        daily = [c for _, c, _ in series[daily_start:]]
+        ma200 = round(sum(daily[-200:]) / 200, 4) if len(daily) >= 200 else None
+        window = daily[-252:] if len(daily) >= 252 else None
         high52 = round(max(window), 4) if window else None
         low52 = round(min(window), 4) if window else None
 

@@ -63,7 +63,7 @@ def collect_one(ticker: str, adapter: YahooAdapter, store: Store,
 
     stats: dict = {}
     try:
-        history = adapter.fetch_history(sym, rng="3y")
+        history = adapter.fetch_history(sym, rng="max")
         stats = store.upsert_history(ticker, history, adapter.name)
         if stats.get("ma200") is None:
             notes.append(f"거래일 {stats.get('days')}일치뿐 — 200일선 없음(가격 위치 항목 중립)")
