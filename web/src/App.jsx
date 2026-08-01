@@ -78,7 +78,7 @@ function Calculator({ mode, etfs, onDoc }) {
   useEffect(() => {
     // 계좌모드가 바뀌면 담을 수 있는 종목이 달라진다. 결과는 무효화한다.
     setPicked([]); setData(null); setErr('')
-  }, [mode])
+  }, [])
 
   const toggle = (t) =>
     setPicked(p => p.includes(t) ? p.filter(x => x !== t) : [...p, t])
@@ -620,7 +620,7 @@ function Ledger({ etfs, onDoc, onChanged }) {
 
 const MONTH_LABEL = (y, m) => `${y}.${String(m).padStart(2, '0')}`
 
-function Calendar({ mode, onDoc }) {
+function Calendar({ onDoc }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [open, setOpen] = useState(null)
@@ -628,7 +628,7 @@ function Calendar({ mode, onDoc }) {
   useEffect(() => {
     setData(null); setErr('')
     api.calendar().then(setData).catch(e => setErr(e.message))
-  }, [mode])
+  }, [])
 
   if (err) return <div className="card"><Err msg={err} /></div>
   if (!data) return <div className="card"><div className="empty">불러오는 중…</div></div>
@@ -767,14 +767,14 @@ const Signed = ({ v, suffix = '원' }) => (
   </b>
 )
 
-function Returns({ mode, onDoc, reloadKey }) {
+function Returns({ onDoc, reloadKey }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
 
   useEffect(() => {
     setData(null); setErr('')
     api.returns(mode).then(setData).catch(e => setErr(e.message))
-  }, [mode, reloadKey])
+  }, [reloadKey])
 
   if (err) return <div className="card"><Err msg={err} /></div>
   if (!data || data.empty) return null
@@ -865,14 +865,14 @@ function Returns({ mode, onDoc, reloadKey }) {
   )
 }
 
-function Dashboard({ mode, onDoc, reloadKey }) {
+function Dashboard({ onDoc, reloadKey }) {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
 
   useEffect(() => {
     setData(null); setErr('')
     api.portfolio().then(setData).catch(e => setErr(e.message))
-  }, [mode, reloadKey])
+  }, [reloadKey])
 
   if (err) return <div className="card"><Err msg={err} /></div>
   if (!data) return <div className="card"><div className="empty">불러오는 중…</div></div>
@@ -935,8 +935,8 @@ export default function App() {
 
       {tab === 'home' && (
         <>
-          <Returns mode="US_TAXABLE" onDoc={setDoc} reloadKey={reloadKey} />
-          <Dashboard mode="US_TAXABLE" onDoc={setDoc} reloadKey={reloadKey} />
+          <Returns onDoc={setDoc} reloadKey={reloadKey} />
+          <Dashboard onDoc={setDoc} reloadKey={reloadKey} />
         </>
       )}
       {tab === 'calc' && <Calculator etfs={etfs} onDoc={setDoc} />}
@@ -947,7 +947,7 @@ export default function App() {
           <Duplicates onDoc={setDoc} />
         </>
       )}
-      {tab === 'cal' && <Calendar mode="US_TAXABLE" onDoc={setDoc} key={reloadKey} />}
+      {tab === 'cal' && <Calendar onDoc={setDoc} key={reloadKey} />}
       {tab === 'ledger' && (
         <>
           <Ledger etfs={etfs} onDoc={setDoc}
