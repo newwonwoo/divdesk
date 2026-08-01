@@ -40,7 +40,7 @@ def imports() -> bool:
     mods = ["collector.sources.base", "collector.sources.yahoo",
             "collector.sources.stockanalysis", "collector.sources.naver_kr",
             "collector.store", "collector.run_us", "collector.run_kr", "collector.probe_kr",
-            "collector.sync_toss",
+            "collector.sync_toss", "collector.opening_balance",
             "engine.tax", "engine.calc", "engine.score", "engine.calendar", "engine.returns", "engine.projection",
             "alerts.push", "alerts.run_alerts", "api.main"]
     proc = subprocess.run(
@@ -256,6 +256,19 @@ port = portfolio_return([one], US_TAXABLE, tx)
 eq("미실현이익엔 배당세만", port.dividend_tax_krw, round(500_000 * 0.15))
 eq("매도 가정 양도세 별도 표기", port.estimated_capgain_tax_krw > 0, True)
 eq("평가손익 세금 미부과 안내", any('팔지 않은' in n for n in port.notes), True)
+
+# 기초 잔고(매수일 불명)는 환차익 계산에서 빠져야 한다
+mixed = position_return(
+    [Lot('M', 100, 100.0, 1300.0), Lot('M', 50, 100.0, None, is_opening=True)],
+    110.0, 1430.0)
+eq("기초 잔고 수량 표시", mixed.opening_qty, 50.0)
+eq("환차익은 아는 물량만", mixed.fx_gain_krw, 1_430_000)   # 100주분 × (1430-1300)×100 ÷ ...
+eq("총손익은 전량 반영", mixed.price_gain_krw + mixed.fx_gain_krw,
+   mixed.value_krw - mixed.cost_krw)
+eq("기초 잔고 안내", any('과거 보유분' in n for n in mixed.notes), True)
+
+only_known = position_return([Lot('K2', 100, 100.0, 1300.0)], 110.0, 1430.0)
+eq("기초 잔고 없으면 표시 0", only_known.opening_qty, 0.0)
 
 loss = position_return([Lot('L', 100, 100.0, 1400.0)], 90.0, 1400.0, dividends_since=2_000_000)
 eq("시세손실을 배당이 메우는 경우", loss.price_gain_krw < 0 and loss.total_gain_krw > 0, True)

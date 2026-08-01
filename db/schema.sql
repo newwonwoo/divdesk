@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS purchase (
   fee numeric(18,4) DEFAULT 0,
   account_mode text NOT NULL CHECK (account_mode IN ('US_TAXABLE','KR_TAXABLE','KR_SHELTER')),
   memo text,
+  -- 증권사 API가 주지 않는 과거 보유분. 매수일·환율을 모르므로
+  -- 환차익 계산에서 제외한다. 수량과 원가만 유효하다.
+  is_opening_balance boolean DEFAULT false,
   created_at timestamptz DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS ix_purchase_ticker ON purchase(ticker, trade_date);

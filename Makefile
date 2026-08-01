@@ -1,4 +1,4 @@
-.PHONY: help install db seed verify probe toss toss-dry collect collect-us collect-kr collect-dry score serve web alerts alerts-dry vapid clean
+.PHONY: help install db seed verify probe toss toss-dry opening collect collect-us collect-kr collect-dry score serve web alerts alerts-dry vapid clean
 
 help:
 	@echo "install      의존성 설치 (python + npm)"
@@ -16,6 +16,7 @@ help:
 	@echo "vapid        웹푸시 키 생성 (최초 1회)"
 	@echo "toss-dry     토스 매수이력 동기화 (저장 안 함)"
 	@echo "toss         토스 매수이력 동기화"
+	@echo "opening      기초 잔고 보정 (주문이력 이전 보유분)"
 
 install:
 	pip install -r requirements.txt
@@ -64,6 +65,9 @@ toss-dry:
 
 toss:
 	python3 -m collector.sync_toss
+
+opening:
+	python3 -m collector.opening_balance
 
 vapid:
 	python3 -m alerts.push --gen-keys

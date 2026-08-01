@@ -484,7 +484,7 @@ def portfolio_returns(account_mode: str = "US_TAXABLE"):
         raise HTTPException(400, f"계좌모드는 {MODES} 중 하나여야 합니다")
 
     lots_raw = rows("""SELECT p.ticker, p.qty, p.price, p.fx_at_buy, p.fee,
-                              p.trade_date, m.name, m.market
+                              p.trade_date, p.is_opening_balance, m.name, m.market
                        FROM purchase p JOIN etf_master m USING (ticker)
                        WHERE p.account_mode=%s ORDER BY p.ticker, p.trade_date""",
                     (account_mode,))
@@ -518,7 +518,8 @@ def portfolio_returns(account_mode: str = "US_TAXABLE"):
         lots = [Lot(ticker=ticker, qty=float(r["qty"]), price=float(r["price"]),
                     fx_at_buy=float(r["fx_at_buy"]) if r["fx_at_buy"] else None,
                     fee=float(r["fee"] or 0), currency=currency,
-                    name=r["name"] or "") for r in group]
+                    name=r["name"] or "",
+                    is_opening=bool(r["is_opening_balance"])) for r in group]
         positions.append(position_return(lots, float(px[0]["close"]), fx, dividend_krw))
 
     if not positions:

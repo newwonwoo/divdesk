@@ -32,6 +32,7 @@ class Lot:
     fee: float = 0.0
     currency: str = "USD"
     name: str = ""
+    is_opening: bool = False      # 증권사 API 이전의 보유분
 
 
 @dataclass
@@ -44,10 +45,11 @@ class PositionReturn:
     cost_krw: float               # 원화 투자원금 (매수 시점 환율 적용)
     value_krw: float              # 현재 원화 평가액
     price_gain_krw: float         # 순수 시세차익 (환율 고정 가정)
-    fx_gain_krw: float            # 환차익
+    fx_gain_krw: float            # 환차익 (매수일을 아는 물량에서만)
     dividend_krw: float           # 보유 후 받은 배당 (세전)
     total_gain_krw: float
     return_pct: float
+    opening_qty: float = 0.0      # 매수 이력이 없는 보유분
     currency: str = "USD"
     notes: list[str] = field(default_factory=list)
 
@@ -91,26 +93,54 @@ def position_return(lots: list[Lot], current_price: float, fx_now: float,
 
     cost_krw = 0.0
     cost_local = 0.0
+    # 매수일을 아는 물량만 따로 센다. 환차익은 이 부분에서만 계산한다.
+    known_qty = 0.0
+    known_cost_local = 0.0
+    known_cost_krw = 0.0
+    opening_qty = 0.0
     notes: list[str] = []
+
     for lot in lots:
+        local = lot.qty * lot.price + lot.fee
+        cost_local += local
+        if lot.is_opening:
+            # 증권사 API 이전 보유분. 언제 샀는지 모르므로 환율을 추정하지 않는다.
+            opening_qty += lot.qty
+            cost_krw += local * (lot.fx_at_buy or fx_now)
+            continue
         rate = 1.0 if currency == "KRW" else (lot.fx_at_buy or fx_now)
         if currency == "USD" and not lot.fx_at_buy:
             notes.append("매수 시점 환율이 없는 건이 있어 현재 환율로 대체했습니다 "
                          "— 환차익이 실제보다 작게 나옵니다")
-        local = lot.qty * lot.price + lot.fee
-        cost_local += local
         cost_krw += local * rate
+        known_qty += lot.qty
+        known_cost_local += local
+        known_cost_krw += local * rate
 
     avg_price = cost_local / total_qty
     value_local = total_qty * current_price
     value_krw = _krw(value_local, currency, fx_now)
 
-    # 시세차익과 환차익 분리:
-    #   시세차익 = (현재가 - 평단) × 수량 × 매수시 평균환율
-    #   환차익   = 나머지 (원화 평가액 - 원가 - 시세차익)
-    avg_fx = (cost_krw / cost_local) if cost_local else 1.0
-    price_gain_krw = (value_local - cost_local) * avg_fx
-    fx_gain_krw = (value_krw - cost_krw) - price_gain_krw
+    # 시세차익은 전량 기준, 환차익은 매수일을 아는 물량에서만 낸다.
+    # 모르는 물량에 현재 환율을 끼워 넣으면 환차익이 0에 수렴해 실제를 흐린다.
+    if currency == "KRW" or known_qty <= 0:
+        avg_fx = (cost_krw / cost_local) if cost_local else 1.0
+        price_gain_krw = (value_local - cost_local) * avg_fx
+        fx_gain_krw = 0.0 if currency == "KRW" else (value_krw - cost_krw) - price_gain_krw
+    else:
+        known_avg_fx = known_cost_krw / known_cost_local if known_cost_local else fx_now
+        # 아는 물량 몫의 평가액·원가로만 환차익을 낸다
+        known_value_local = known_qty * current_price
+        known_value_krw = known_value_local * fx_now
+        known_price_gain = (known_value_local - known_cost_local) * known_avg_fx
+        fx_gain_krw = (known_value_krw - known_cost_krw) - known_price_gain
+        # 시세차익은 전량 기준 (원가 전체를 알고 있으므로 계산 가능)
+        price_gain_krw = (value_krw - cost_krw) - fx_gain_krw
+
+    if opening_qty > 0:
+        notes.append(f"이 중 {opening_qty:,.4f}주는 증권사가 매수 이력을 주지 않는 "
+                     "과거 보유분입니다. 수량·원가는 반영했지만 매수 시점을 알 수 없어 "
+                     "환차익 계산에서는 제외했습니다.")
 
     total_gain = price_gain_krw + fx_gain_krw + dividends_since
     return PositionReturn(
@@ -118,6 +148,7 @@ def position_return(lots: list[Lot], current_price: float, fx_now: float,
         avg_price=round(avg_price, 4), current_price=current_price,
         cost_krw=round(cost_krw), value_krw=round(value_krw),
         price_gain_krw=round(price_gain_krw), fx_gain_krw=round(fx_gain_krw),
+        opening_qty=round(opening_qty, 6),
         dividend_krw=round(dividends_since), total_gain_krw=round(total_gain),
         return_pct=round(total_gain / cost_krw * 100, 2) if cost_krw else 0.0,
         currency=currency, notes=list(dict.fromkeys(notes)),
