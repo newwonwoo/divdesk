@@ -64,7 +64,8 @@ function MonthStrip({ values }) {
 
 /* ── 계산기 ───────────────────────────── */
 
-function Calculator({ mode, etfs, onDoc }) {
+function Calculator({ etfs, onDoc }) {
+  const [mode, setMode] = useState('US_TAXABLE')
   const [dir, setDir] = useState('forward')
   const [amount, setAmount] = useState('50,000,000')
   const [target, setTarget] = useState('1,000,000')
@@ -100,6 +101,14 @@ function Calculator({ mode, etfs, onDoc }) {
     <>
       <div className="card">
         <h2>계산 방향 <InfoBtn k="dir" onOpen={onDoc} /></h2>
+        <label>계좌</label>
+        <select value={mode} onChange={e => { setMode(e.target.value); setData(null) }}>
+          {MODES.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}
+        </select>
+        {mode === 'KR_SHELTER' && (
+          <div className="hint">절세계좌에는 국내상장 ETF만 담을 수 있습니다.</div>
+        )}
+        <div style={{ marginTop: 14 }} />
         <div className="dir">
           <button aria-selected={dir === 'forward'} onClick={() => { setDir('forward'); setData(null) }}>
             금액 → 월배당
@@ -467,10 +476,10 @@ function SyncStatus({ onChanged }) {
 
 /* ── 잔고 대조 ────────────────────────── */
 
-function Reconcile({ onDoc, reloadKey }) {
+function Reconcile({ onDoc, refresh }) {
   const [data, setData] = useState(null)
 
-  useEffect(() => { api.reconcile().then(setData).catch(() => setData(null)) }, [reloadKey])
+  useEffect(() => { api.reconcile().then(setData).catch(() => setData(null)) }, [refresh])
   if (!data) return null
   if (!data.available) return (
     <div className="card">
@@ -532,7 +541,7 @@ function Ledger({ etfs, onDoc, onChanged }) {
     try {
       await api.addPurchase({
         ticker: form.ticker, trade_date: form.trade_date,
-        qty: Number(form.qty), price: Number(form.price), account_mode: mode,
+        qty: Number(form.qty), price: uncomma(form.price), account_mode: 'KR_SHELTER',
       })
       setForm({ ticker: '', trade_date: today(), qty: '', price: '' })
       await load(); onChanged?.()
@@ -549,7 +558,7 @@ function Ledger({ etfs, onDoc, onChanged }) {
   return (
     <>
       <SyncStatus onChanged={() => { load(); onChanged?.() }} />
-      <Reconcile onDoc={onDoc} reloadKey={items.length} />
+      <Reconcile onDoc={onDoc} refresh={items.length} />
       <div className="card">
         <button className="fold-head" onClick={() => setManual(!manual)} aria-expanded={manual}>
           <span>절세계좌 기록 직접 입력</span>
@@ -773,7 +782,7 @@ function Returns({ onDoc, reloadKey }) {
 
   useEffect(() => {
     setData(null); setErr('')
-    api.returns(mode).then(setData).catch(e => setErr(e.message))
+    api.returns().then(setData).catch(e => setErr(e.message))
   }, [reloadKey])
 
   if (err) return <div className="card"><Err msg={err} /></div>
