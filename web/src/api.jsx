@@ -35,6 +35,7 @@ export const api = {
   pushKey: () => req('/push/key'),
   pushTest: () => req('/push/test', { method: 'POST' }),
   alerts: () => req('/alerts'),
+  syncStatus: () => req('/sync/status'),
 }
 
 export const won = (n) =>

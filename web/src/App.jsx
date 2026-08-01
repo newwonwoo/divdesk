@@ -242,6 +242,44 @@ function Screener({ etfs, onDoc }) {
   )
 }
 
+/* ── 동기화 상태 ──────────────────────── */
+
+const AGO = (iso) => {
+  if (!iso) return '없음'
+  const days = Math.floor((Date.now() - new Date(iso)) / 86400000)
+  return days === 0 ? '오늘' : days === 1 ? '어제' : `${days}일 전`
+}
+
+function SyncStatus() {
+  const [data, setData] = useState(null)
+
+  useEffect(() => { api.syncStatus().then(setData).catch(() => setData(null)) }, [])
+  if (!data) return null
+
+  const bad = data.items.filter(i => i.state !== 'ok')
+  if (!bad.length) {
+    const toss = data.items.find(i => i.source === 'toss')
+    return (
+      <div className="asof" style={{ marginBottom: 10 }}>
+        데이터 갱신 {AGO(toss?.last_success)}
+      </div>
+    )
+  }
+  return (
+    <div className="warn" style={{ marginTop: 0, marginBottom: 12 }}>
+      <b>데이터가 갱신되지 않고 있습니다</b>
+      {bad.map(i => (
+        <div key={i.source} style={{ marginTop: 4 }}>
+          {i.label}: {i.message} · 마지막 성공 {AGO(i.last_success)}
+        </div>
+      ))}
+      <div style={{ marginTop: 6, fontSize: 11 }}>
+        아래 숫자는 그 시점 기준이라 지금과 다를 수 있습니다.
+      </div>
+    </div>
+  )
+}
+
 /* ── 매수기록 ─────────────────────────── */
 
 const today = () => new Date().toISOString().slice(0, 10)
@@ -283,6 +321,7 @@ function Ledger({ mode, etfs, onDoc, onChanged }) {
 
   return (
     <>
+      <SyncStatus />
       <div className="card">
         <h2>매수 기록 추가</h2>
         <div className="grid2">

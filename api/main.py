@@ -637,6 +637,51 @@ def quality(ticker: str, years: int = 5):
                      "못한 결과입니다." if gap is not None and gap < 0 else None)}
 
 
+@app.get("/sync/status")
+def sync_status():
+    """동기화가 언제 마지막으로 성공했는지. 조용히 멈춘 걸 화면에서 알리기 위함."""
+    out = []
+    for source, label in (("toss", "토스증권"), ("us", "미국 시세"), ("kr", "국내 시세")):
+        last_ok = rows("""SELECT ran_at, added, message FROM sync_log
+                          WHERE source=%s AND ok ORDER BY ran_at DESC LIMIT 1""",
+                       (source,))
+        recent = rows("""SELECT ok, message, ran_at FROM sync_log
+                         WHERE source=%s ORDER BY ran_at DESC LIMIT 1""", (source,))
+        if not recent:
+            out.append({"source": source, "label": label, "state": "never",
+                        "message": "아직 실행된 적이 없습니다."})
+            continue
+
+        latest = recent[0]
+        entry = {
+            "source": source, "label": label,
+            "last_run": latest["ran_at"],
+            "last_success": last_ok[0]["ran_at"] if last_ok else None,
+            "added": last_ok[0]["added"] if last_ok else 0,
+        }
+        if latest["ok"]:
+            stale_days = (date.today() - latest["ran_at"].date()).days
+            entry["state"] = "stale" if stale_days >= 3 else "ok"
+            entry["message"] = (f"{stale_days}일째 갱신되지 않았습니다."
+                                if stale_days >= 3 else "정상")
+        else:
+            entry["state"] = "failed"
+            entry["message"] = latest["message"] or "원인 불명"
+            if last_ok:
+                behind = (date.today() - last_ok[0]["ran_at"].date()).days
+                entry["message"] += f" (마지막 성공 {behind}일 전)"
+        out.append(entry)
+
+    worst = "ok"
+    for entry in out:
+        if entry["state"] in ("failed", "never"):
+            worst = "failed"
+            break
+        if entry["state"] == "stale":
+            worst = "stale"
+    return {"overall": worst, "items": out}
+
+
 # ---------- 푸시 알림 ----------
 class PushSub(BaseModel):
     endpoint: str

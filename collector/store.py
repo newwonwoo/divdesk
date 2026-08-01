@@ -120,6 +120,25 @@ class Store:
             (src, ticker, json.dumps(payload, default=str)))
         self._bump("raw")
 
+    def record_sync(self, source: str, ok: bool, added: int, message: str = "") -> None:
+        """동기화 결과를 남긴다.
+
+        조용히 멈춘 채 낡은 숫자를 보여주는 것이 가장 나쁜 실패 방식이라,
+        성공·실패 모두 기록해 화면에서 알 수 있게 한다.
+        기록 자체가 실패해도 수집을 망치지 않는다.
+        """
+        if self.dry_run:
+            return
+        try:
+            conn = self.connect()
+            with conn.cursor() as cur:
+                cur.execute("""INSERT INTO sync_log (source, ok, added, message)
+                               VALUES (%s,%s,%s,%s)""",
+                            (source, ok, added, (message or "")[:500]))
+            conn.commit()
+        except Exception:                                     # noqa: BLE001
+            pass
+
     def summary(self) -> str:
         mode = "DRY-RUN(DB 미접속)" if self.dry_run else self.dsn
         parts = ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items()))

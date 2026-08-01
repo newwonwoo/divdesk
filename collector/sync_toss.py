@@ -34,7 +34,7 @@ import argparse
 import os
 import time
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -115,12 +115,25 @@ def fetch_filled_orders(token: str, account: str, since: date | None = None) -> 
 
     out: list[dict] = []
     cursor = None
-    for _ in range(50):                      # 안전장치
+    partial: str | None = None
+    for _ in range(60):                      # 안전장치
         if cursor:
             params["cursor"] = cursor
-        resp = _get(ORDERS_URL, headers, params)
+        try:
+            resp = _get(ORDERS_URL, headers, params)
+        except (TossError, requests.RequestException) as exc:
+            # 중간에 끊겨도 여기까지 받은 건 살린다. orderId 중복 판별이 있어
+            # 다음 실행이 이어받아도 같은 주문이 두 번 들어가지 않는다.
+            partial = f"{type(exc).__name__}: {exc}"
+            break
+        if resp.status_code >= 500:
+            partial = f"서버 오류 {resp.status_code}"
+            break
         if resp.status_code != 200:
-            raise TossError(f"주문 조회 실패 {resp.status_code}: {resp.text[:200]}")
+            if not out:
+                raise TossError(f"주문 조회 실패 {resp.status_code}: {resp.text[:200]}")
+            partial = f"HTTP {resp.status_code}"
+            break
         result = resp.json().get("result", {})
         out += result.get("orders", [])
         if not result.get("hasNext"):
@@ -128,6 +141,9 @@ def fetch_filled_orders(token: str, account: str, since: date | None = None) -> 
         cursor = result.get("nextCursor")
         if not cursor:
             break
+    if partial:
+        print(f"  ⚠ 조회가 중간에 끊겼습니다({partial}). "
+              f"받은 {len(out)}건까지만 반영하고, 나머지는 다음 실행에서 이어받습니다.")
     return out
 
 
@@ -215,6 +231,21 @@ def known_tickers(store: Store) -> dict:
         return {t: m for t, m in cur.fetchall()}
 
 
+def last_synced(store: Store) -> date | None:
+    """이미 반영한 가장 최근 매수일.
+
+    매일 전체를 훑을 이유가 없다. 5,000건을 매번 받으면 호출 한도에도
+    가깝고 시간도 오래 걸린다. 마지막 매수일 며칠 전부터만 조회한다.
+    (겹치는 날짜는 orderId 중복 판별이 걸러내므로 안전하다)
+    """
+    conn = _conn(store)
+    with conn.cursor() as cur:
+        cur.execute("""SELECT MAX(trade_date) FROM purchase
+                       WHERE memo LIKE 'toss:%'""")
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
 def existing_order_ids(store: Store) -> set:
     conn = _conn(store)
     with conn.cursor() as cur:
@@ -231,11 +262,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="저장하지 않고 보기만")
     parser.add_argument("--from", dest="since", help="조회 시작일 YYYY-MM-DD")
+    parser.add_argument("--full", action="store_true",
+                        help="전체 이력 재조회 (기본은 마지막 매수일 이후만)")
     args = parser.parse_args(argv)
 
-    since = None
+    store = Store(dry_run=args.dry_run)
+    try:
+        universe = known_tickers(store)
+        already = existing_order_ids(store)
+        latest = last_synced(store)
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"DB 연결 실패: {type(exc).__name__}: {exc}")
+        return 1
+
     if args.since:
         since = date.fromisoformat(args.since)
+    elif args.full or latest is None:
+        since = None
+    else:
+        # 며칠 겹쳐서 받는다. 체결일이 밀린 주문을 놓치지 않기 위해서다.
+        since = latest - timedelta(days=7)
+    if since:
+        print(f"{since} 이후 주문만 조회합니다 (전체는 --full)")
 
     try:
         cid, secret, account = _credentials()
@@ -243,14 +291,13 @@ def main(argv: list[str] | None = None) -> int:
         orders = fetch_filled_orders(token, account, since)
     except TossError as exc:
         print(f"토스 연동 실패: {exc}")
+        if not args.dry_run:
+            store.record_sync("toss", False, 0, str(exc))
         return 1
-
-    store = Store(dry_run=args.dry_run)
-    try:
-        universe = known_tickers(store)
-        already = existing_order_ids(store)
-    except Exception as exc:                                  # noqa: BLE001
-        print(f"DB 연결 실패: {type(exc).__name__}: {exc}")
+    except requests.RequestException as exc:
+        print(f"네트워크 오류: {type(exc).__name__}")
+        if not args.dry_run:
+            store.record_sync("toss", False, 0, f"{type(exc).__name__}: {exc}")
         return 1
 
     added, skipped_dup, unknown, invalid = [], 0, [], 0
@@ -280,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.dry_run:
         store.commit()
+        store.record_sync("toss", True, len(added),
+                          f"조회 {len(orders)}건, 신규 {len(added)}건")
 
     print(f"체결 주문 {len(orders)}건 조회 → 신규 매수 {len(added)}건 반영")
     for item in added:

@@ -107,6 +107,18 @@ CREATE TABLE IF NOT EXISTS income_ledger (
 -- 휴장일 테이블은 두지 않는다. 수집된 시세의 '거래가 있었던 날짜'가 곧 거래일이고,
 -- 평일 중 빠진 날이 휴장일이다. 별도 표를 관리하면 매년 갱신 누락으로 틀어진다.
 
+-- 동기화 결과 기록. 화면에서 '언제 마지막으로 성공했는지'를 보여주기 위해 남긴다.
+-- 조용히 멈춘 채 낡은 숫자를 보는 것이 가장 나쁜 실패 방식이다.
+CREATE TABLE IF NOT EXISTS sync_log (
+  id bigserial PRIMARY KEY,
+  source text NOT NULL,            -- toss | us | kr
+  ok boolean NOT NULL,
+  added int DEFAULT 0,
+  message text,
+  ran_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_sync_recent ON sync_log(source, ran_at DESC);
+
 CREATE TABLE IF NOT EXISTS push_subscription (
   id bigserial PRIMARY KEY,
   endpoint text UNIQUE NOT NULL,

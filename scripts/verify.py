@@ -139,6 +139,12 @@ eq("분기배당 주기 도출", infer_pays_per_year(mk(91, 10)), 4)
 eq("이력 부족시 판단 보류", infer_pays_per_year(mk(30, 2)), None)
 eq("국내 심볼 변환", symbol('458730'), '458730.KS')
 
+# --- 동기화 기록 (dry-run 은 쓰지 않는다) ---
+from collector.store import Store as _Store
+_dry = _Store(dry_run=True)
+_dry.record_sync("toss", True, 5, "test")
+eq("dry-run 은 기록하지 않음", _dry.counts.get("statements", 0), 0)
+
 # --- 토스 주문 변환 ---
 from collector.sync_toss import to_purchase, account_mode
 buy = {"orderId": "abc", "symbol": "SCHD", "side": "BUY", "currency": "USD",

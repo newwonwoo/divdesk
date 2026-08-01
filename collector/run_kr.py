@@ -132,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
             failed.append((ticker, f"{type(exc).__name__}: {exc}"))
 
     store.commit()
+    store.record_sync("kr", not failed, len(ok),
+                      f"성공 {len(ok)} 실패 {len(failed)}")
 
     print(f"{'코드':<8}{'종가':>10}{'TTM분배':>10}{'배당률%':>9}{'주기':>5}  종목명")
     for r in ok:

@@ -131,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
         fx_line = f"환율 수집 실패: {type(exc).__name__}"
 
     store.commit()
+    store.record_sync("us", not failed, len(rows),
+                      f"성공 {len(rows)} 실패 {len(failed)}")
 
     print(f"{'종목':<6}{'종가':>10}{'TTM배당':>10}{'배당률%':>9}{'횟수':>5}  최근배당락")
     for row in rows:
