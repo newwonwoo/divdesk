@@ -137,7 +137,87 @@ nav button[aria-selected=true]{color:var(--in);box-shadow:inset 0 2px 0 var(--in
   .card{padding:20px 24px}
   .result .big{font-size:40px}
   .rows{font-size:15.5px}
-  nav{max-width:720px;margin:0 auto;border-left:1px solid var(--rule);border-right:1px solid var(--rule)}
+  /* 하단 탭이 화면 전체에 걸치면 가운데 정렬된 본문과 어긋나 보인다.
+     본문과 같은 폭으로 묶어 정렬을 맞춘다. */
+  nav{left:50%;right:auto;transform:translateX(-50%);width:100%;max-width:720px;
+    border-left:1px solid var(--rule);border-right:1px solid var(--rule)}
   nav button{max-width:none;font-size:14px}
   .strip{height:130px}
 }
+
+/* ── 접이식 안내 ─────────────────────── */
+/* 매번 같은 세금 설명을 읽게 하면 정작 숫자가 안 보인다. 기본은 접어 둔다. */
+.fold{margin-top:12px;border-top:1px solid var(--rule)}
+.fold-head{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:13px 0;background:none;border:0;font-family:inherit;font-size:13.5px;
+  color:var(--ink-2);cursor:pointer;text-align:left;min-height:46px}
+.fold-mark{font-size:17px;color:var(--ink-2);flex:0 0 auto}
+.fold-body{padding:0 0 12px;font-size:13px;color:#28344B}
+.fold-body p{margin-bottom:7px}
+.fold-body p:last-child{margin-bottom:0}
+.fold-list .fold-head{border-bottom:1px dotted var(--rule)}
+
+/* ── 큰 숫자 ─────────────────────────── */
+.hero{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+.hero-v{font-family:var(--mono);font-size:32px;font-weight:700;letter-spacing:-.02em;
+  line-height:1.15;color:var(--in)}
+.hero-p{font-family:var(--mono);font-size:17px;font-weight:700;color:var(--ink-2)}
+.hero-sub{font-size:13px;color:var(--ink-2);margin-bottom:14px}
+
+/* ── 지표 카드 ───────────────────────── */
+.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}
+.metric{background:var(--paper);border-radius:3px;padding:12px 14px}
+.metric-l{font-size:12.5px;color:var(--ink-2);margin-bottom:5px}
+.metric-v{font-family:var(--mono);font-size:17px;font-weight:700;word-break:break-all}
+.metric-v.big{font-size:22px}
+.metric-s{font-size:11.5px;color:var(--ink-2);margin-top:4px}
+
+/* ── 목록 행 ─────────────────────────── */
+.row-item{display:flex;gap:12px;padding:14px 0;border-bottom:1px solid var(--rule);
+  align-items:flex-start}
+.row-item:last-child{border-bottom:0}
+.row-main{flex:1;min-width:0}
+.row-right{text-align:right;flex:0 0 auto}
+.row-right b{font-family:var(--mono);font-size:16px;display:block}
+.row-right s{display:block;text-decoration:none !important;font-size:11.5px;color:var(--ink-2);margin-top:2px}
+.kv{display:flex;flex-wrap:wrap;gap:10px;font-size:12.5px;color:var(--ink-2);margin-top:5px}
+.kv b{font-family:var(--mono)}
+.hint{font-size:12px;color:var(--ink-2);margin-top:7px;line-height:1.5}
+.hint.out{color:var(--out)}
+
+/* ── 타점 항목표 ─────────────────────── */
+/* 한 덩어리 문장은 훑기 어렵다. 라벨과 값을 나눈다. */
+.facts{margin-top:8px;display:grid;gap:5px}
+.facts div{display:flex;gap:10px;align-items:baseline}
+.facts dt{flex:0 0 62px;font-size:12px;color:var(--ink-2)}
+.facts dd{flex:1;min-width:0;font-size:13px;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}
+.facts dd b{font-family:var(--mono);font-weight:700}
+.facts dd span{font-size:12px;color:var(--ink-2)}
+
+/* ── 종목 선택 목록 ──────────────────── */
+/* 티커만 보여주면 국내 종목은 숫자라 알아볼 수 없다. */
+.picklist{display:grid;gap:8px;margin-top:8px}
+.pick{display:block;width:100%;text-align:left;padding:12px 14px;background:#fff;
+  border:1px solid var(--rule);border-radius:3px;cursor:pointer;font-family:inherit;
+  min-height:56px}
+.pick[aria-pressed=true]{background:#DDE6E4;border-color:var(--in)}
+.pick-name{display:block;font-size:14.5px;font-weight:600;color:var(--ink)}
+.pick-meta{display:block;font-size:12px;color:var(--ink-2);margin-top:3px}
+
+.pick-info{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.tag{display:inline-block;font-size:11.5px;padding:3px 8px;background:var(--paper);
+  color:var(--ink-2);border-radius:2px;margin-left:6px}
+.tag.warn-tag{background:#FBF0EA;color:var(--out)}
+.tag.bench{background:#E6EDF6;color:#1B3A63}
+
+.picked{margin-top:14px;border-top:1px solid var(--ink);padding-top:6px}
+.picked-row{display:flex;align-items:center;gap:10px;padding:10px 0;
+  border-bottom:1px dotted var(--rule);font-size:14px}
+.picked-row span:first-child{flex:1;min-width:0}
+.picked-row.total{border-bottom:0;font-weight:700;border-top:1px solid var(--rule)}
+
+select{width:100%;padding:12px;min-height:46px;border:1px solid var(--rule);
+  border-radius:2px;font-family:inherit;font-size:15px;background:#fff;color:var(--ink)}
+
+/* <s> 를 보조 수치 표시에 쓰고 있다. 브라우저 기본 취소선을 전부 해제한다. */
+s { text-decoration: none; }
