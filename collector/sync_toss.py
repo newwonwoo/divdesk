@@ -182,13 +182,25 @@ def to_purchase(order: dict) -> dict | None:
     }
 
 
+def _conn(store: Store):
+    """dry-run 이어도 읽기는 해야 한다.
+
+    Store.dry_run 은 '쓰지 않는다'는 뜻이지 '읽지 않는다'가 아니다.
+    종목 목록과 중복 판별은 조회해야 하므로 별도 연결을 쓴다.
+    """
+    if store._conn is None:
+        import psycopg
+        store._conn = psycopg.connect(store.dsn)
+    return store._conn
+
+
 def fx_on(store: Store, day: date) -> float | None:
     """그날의 원달러 환율. 휴장이면 직전 영업일 값을 쓴다.
 
     토스에서 환율을 받지 않는 이유: 이미 매일 수집하고 있고,
     두 소스를 섞으면 값이 어긋났을 때 어느 쪽이 맞는지 알 수 없어진다.
     """
-    conn = store.connect()
+    conn = _conn(store)
     with conn.cursor() as cur:
         cur.execute("""SELECT usdkrw FROM fx_rate
                        WHERE date <= %s ORDER BY date DESC LIMIT 1""", (day,))
@@ -197,14 +209,14 @@ def fx_on(store: Store, day: date) -> float | None:
 
 
 def known_tickers(store: Store) -> dict:
-    conn = store.connect()
+    conn = _conn(store)
     with conn.cursor() as cur:
         cur.execute("SELECT ticker, market FROM etf_master")
         return {t: m for t, m in cur.fetchall()}
 
 
 def existing_order_ids(store: Store) -> set:
-    conn = store.connect()
+    conn = _conn(store)
     with conn.cursor() as cur:
         cur.execute("SELECT memo FROM purchase WHERE memo LIKE 'toss:%'")
         return {row[0].split("toss:", 1)[1] for row in cur.fetchall() if row[0]}
@@ -236,9 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(dry_run=args.dry_run)
     try:
         universe = known_tickers(store)
-        already = existing_order_ids(store) if not args.dry_run else set()
+        already = existing_order_ids(store)
     except Exception as exc:                                  # noqa: BLE001
-        print(f"DB 연결 실패: {type(exc).__name__}")
+        print(f"DB 연결 실패: {type(exc).__name__}: {exc}")
         return 1
 
     added, skipped_dup, unknown, invalid = [], 0, [], 0
