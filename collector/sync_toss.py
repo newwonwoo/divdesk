@@ -10,6 +10,12 @@
 **비밀키는 코드에 넣지 않는다.** .env 에서만 읽는다:
     TOSS_CLIENT_ID / TOSS_CLIENT_SECRET / TOSS_ACCOUNT
 
+TOSS_ACCOUNT 은 **계좌번호가 아니라 accountSeq** 다(보통 1).
+`GET /api/v1/accounts` 응답의 accountSeq 값을 넣는다. 계좌번호를 넣으면
+account-not-found 가 난다.
+
+호출 한도: 주문 조회는 초당 5회. 429 를 받으면 Retry-After 만큼 기다린다.
+
 동기화 규칙:
   - 체결(filledQuantity > 0)된 **매수** 주문만 가져온다. 매도는 별도 처리 대상이라
     이번 범위에 없다.
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 import sys
 from datetime import date, datetime
 
@@ -46,6 +53,7 @@ class TossError(Exception):
 def _credentials() -> tuple[str, str, str]:
     cid = os.environ.get("TOSS_CLIENT_ID")
     secret = os.environ.get("TOSS_CLIENT_SECRET")
+    # 계좌번호가 아니라 accountSeq 다. GET /api/v1/accounts 응답의 accountSeq 값.
     account = os.environ.get("TOSS_ACCOUNT")
     missing = [name for name, value in
                (("TOSS_CLIENT_ID", cid), ("TOSS_CLIENT_SECRET", secret),
@@ -56,8 +64,17 @@ def _credentials() -> tuple[str, str, str]:
 
 
 def get_token(client_id: str, client_secret: str) -> str:
+    """AUTH 그룹은 초당 5회 제한. 한 번만 받아 쓰므로 여유롭다."""
     resp = requests.post(TOKEN_URL, data={"grant_type": "client_credentials"},
                          auth=(client_id, client_secret), timeout=20)
+    if resp.status_code == 429:
+        time.sleep(float(resp.headers.get("Retry-After", 2)) + 0.5)
+        resp = requests.post(TOKEN_URL, data={"grant_type": "client_credentials"},
+                             auth=(client_id, client_secret), timeout=20)
+    if resp.status_code == 403:
+        raise TossError(
+            "허용 IP가 아닙니다. 토스 개발자센터 > 설정 > Open API > 허용 IP 관리에 "
+            "이 서버 IP를 등록하세요. (확인: curl -s https://checkip.amazonaws.com)")
     if resp.status_code != 200:
         raise TossError(f"토큰 발급 실패 {resp.status_code}: {resp.text[:200]}")
     token = resp.json().get("access_token")
@@ -66,10 +83,32 @@ def get_token(client_id: str, client_secret: str) -> str:
     return token
 
 
+def _get(url: str, headers: dict, params: dict | None = None,
+         min_interval: float = 0.35, max_retry: int = 5):
+    """토스 호출 래퍼. 한도를 지키고, 429면 서버가 알려준 만큼 기다린다.
+
+    주문 조회(ORDER_HISTORY)는 초당 5회 제한이다. 페이지를 연속으로 당기면
+    금방 걸리므로 호출 사이에 간격을 두고, 429가 오면 Retry-After 를 따른다.
+    """
+    for attempt in range(max_retry):
+        time.sleep(min_interval)
+        resp = requests.get(url, headers=headers, params=params, timeout=25)
+        if resp.status_code != 429:
+            return resp
+        wait = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset")
+        try:
+            delay = float(wait)
+        except (TypeError, ValueError):
+            delay = 2.0 * (attempt + 1)
+        print(f"  호출 한도 도달 — {delay:.0f}초 대기 후 재시도")
+        time.sleep(delay + 0.5)
+    raise TossError("호출 한도를 계속 초과합니다. 잠시 후 다시 실행하세요.")
+
+
 def fetch_filled_orders(token: str, account: str, since: date | None = None) -> list[dict]:
     """체결 완료된 주문 전량. 페이지네이션을 끝까지 따라간다."""
     headers = {"Authorization": f"Bearer {token}",
-               "X-Tossinvest-Account": account}
+               "X-Tossinvest-Account": str(account)}
     params = {"status": "CLOSED", "limit": 100}
     if since:
         params["from"] = since.isoformat()
@@ -79,7 +118,7 @@ def fetch_filled_orders(token: str, account: str, since: date | None = None) -> 
     for _ in range(50):                      # 안전장치
         if cursor:
             params["cursor"] = cursor
-        resp = requests.get(ORDERS_URL, headers=headers, params=params, timeout=25)
+        resp = _get(ORDERS_URL, headers, params)
         if resp.status_code != 200:
             raise TossError(f"주문 조회 실패 {resp.status_code}: {resp.text[:200]}")
         result = resp.json().get("result", {})
@@ -94,8 +133,8 @@ def fetch_filled_orders(token: str, account: str, since: date | None = None) -> 
 
 def fetch_holdings(token: str, account: str) -> list[dict]:
     headers = {"Authorization": f"Bearer {token}",
-               "X-Tossinvest-Account": account}
-    resp = requests.get(HOLDINGS_URL, headers=headers, timeout=25)
+               "X-Tossinvest-Account": str(account)}
+    resp = _get(HOLDINGS_URL, headers)
     if resp.status_code != 200:
         raise TossError(f"보유 조회 실패 {resp.status_code}: {resp.text[:200]}")
     return resp.json().get("result", {}).get("items", [])
