@@ -373,12 +373,17 @@ def delete_purchase(purchase_id: int):
 
 # ---------- 포트폴리오 / 워치독 ----------
 @app.get("/portfolio")
-def portfolio(account_mode: str = "US_TAXABLE"):
-    if account_mode not in MODES:
-        raise HTTPException(400, f"계좌모드는 {MODES} 중 하나여야 합니다")
-    owned = rows("""SELECT ticker, SUM(qty) AS qty FROM purchase
-                    WHERE account_mode=%s GROUP BY ticker HAVING SUM(qty)>0""",
-                 (account_mode,))
+def portfolio(account_mode: str = "ALL"):
+    if account_mode != "ALL" and account_mode not in MODES:
+        raise HTTPException(400, f"계좌모드는 ALL 또는 {MODES} 중 하나여야 합니다")
+    if account_mode == "ALL":
+        owned = rows("""SELECT ticker, SUM(qty) AS qty FROM purchase
+                        GROUP BY ticker HAVING SUM(qty)>0""")
+        account_mode = "US_TAXABLE"
+    else:
+        owned = rows("""SELECT ticker, SUM(qty) AS qty FROM purchase
+                        WHERE account_mode=%s GROUP BY ticker HAVING SUM(qty)>0""",
+                     (account_mode,))
     if not owned:
         return {"empty": True, "message": "매수기록이 없습니다."}
     fx, fx_date = latest_fx()
@@ -412,9 +417,11 @@ def watchdog():
 # ---------- 스코어 ----------
 @app.get("/scores")
 def scores(limit: int = 20):
-    return {"items": rows("""SELECT DISTINCT ON (ticker) s.*, m.name, m.is_covered_call
+    return {"items": rows("""SELECT DISTINCT ON (s.ticker) s.*, m.name, m.market,
+                                    m.strategy, m.is_covered_call, m.expense_ratio
                              FROM score_snapshot s JOIN etf_master m USING (ticker)
-                             ORDER BY ticker, date DESC LIMIT %s""", (limit,))}
+                             WHERE m.is_benchmark = false
+                             ORDER BY s.ticker, s.date DESC LIMIT %s""", (limit,))}
 
 
 @app.post("/scores/recompute")
@@ -482,16 +489,18 @@ def recompute():
         note = result.reason + (" ⚠ " + " / ".join(result.warnings) if result.warnings else "")
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO score_snapshot
-                (ticker,date,total,yield_pctile,price_pos,dps_health,total_ret,fx_pos,exdate_pen,reason)
-                VALUES (%s,CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s)
+                (ticker,date,total,yield_pctile,price_pos,dps_health,total_ret,
+                 fx_pos,exdate_pen,reason,facts)
+                VALUES (%s,CURRENT_DATE,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (ticker,date) DO UPDATE SET
                   total=EXCLUDED.total, reason=EXCLUDED.reason,
                   yield_pctile=EXCLUDED.yield_pctile, price_pos=EXCLUDED.price_pos,
                   dps_health=EXCLUDED.dps_health, total_ret=EXCLUDED.total_ret,
-                  fx_pos=EXCLUDED.fx_pos, exdate_pen=EXCLUDED.exdate_pen""",
+                  fx_pos=EXCLUDED.fx_pos, exdate_pen=EXCLUDED.exdate_pen,
+                  facts=EXCLUDED.facts""",
                 (ticker, result.total, result.yield_pctile, result.price_pos,
                  result.dps_health, result.total_ret, result.fx_pos,
-                 result.exdate_pen, note))
+                 result.exdate_pen, note, json.dumps(result.facts, ensure_ascii=False)))
         made += 1
     conn.commit()
     return {"computed": made, "skipped": skipped,
@@ -500,16 +509,24 @@ def recompute():
 
 
 @app.get("/portfolio/returns")
-def portfolio_returns(account_mode: str = "US_TAXABLE"):
-    """배당 + 시세차익 + 환차익을 합친 실제 손익."""
-    if account_mode not in MODES:
-        raise HTTPException(400, f"계좌모드는 {MODES} 중 하나여야 합니다")
+def portfolio_returns(account_mode: str = "ALL"):
+    """배당 + 시세차익 + 환차익을 합친 실제 손익.
 
-    lots_raw = rows("""SELECT p.ticker, p.qty, p.price, p.fx_at_buy, p.fee,
-                              p.trade_date, p.is_opening_balance, m.name, m.market
-                       FROM purchase p JOIN etf_master m USING (ticker)
-                       WHERE p.account_mode=%s ORDER BY p.ticker, p.trade_date""",
-                    (account_mode,))
+    기본은 전 계좌 합산이다. 내 자산은 하나인데 계좌별로 나눠 보여주면
+    계좌를 바꿀 때마다 자산이 사라졌다 나타나 혼란스럽다.
+    """
+    if account_mode != "ALL" and account_mode not in MODES:
+        raise HTTPException(400, f"계좌모드는 ALL 또는 {MODES} 중 하나여야 합니다")
+
+    sql = """SELECT p.ticker, p.qty, p.price, p.fx_at_buy, p.fee,
+                    p.trade_date, p.is_opening_balance, p.account_mode,
+                    m.name, m.market
+             FROM purchase p JOIN etf_master m USING (ticker)"""
+    params: tuple = ()
+    if account_mode != "ALL":
+        sql += " WHERE p.account_mode=%s"
+        params = (account_mode,)
+    lots_raw = rows(sql + " ORDER BY p.ticker, p.trade_date", params)
     if not lots_raw:
         return {"empty": True, "message": "매수기록이 없습니다."}
 
@@ -547,8 +564,25 @@ def portfolio_returns(account_mode: str = "US_TAXABLE"):
     if not positions:
         raise HTTPException(422, f"시세 데이터가 없는 종목뿐입니다: {', '.join(missing)}")
 
-    result = portfolio_return(positions, account_mode, engine(), ytd_income())
-    return {"fx": fx, "fx_date": fx_date, "result": result, "no_price": missing}
+    # 세금은 계좌마다 다르다. 합산 조회일 때는 비중이 가장 큰 계좌 기준으로 내고,
+    # 계좌별 원금을 함께 돌려줘 화면이 구분해 보여줄 수 있게 한다.
+    # 시세가 없어 손익 계산에서 빠진 종목은 원금 집계에서도 빼야 합계가 맞는다.
+    priced = {p.ticker for p in positions}
+    by_account: dict = {}
+    for row in lots_raw:
+        if row["ticker"] not in priced:
+            continue
+        cost = float(row["qty"]) * float(row["price"])
+        rate = float(row["fx_at_buy"] or fx) if row["market"] != "KR" else 1.0
+        by_account[row["account_mode"]] = by_account.get(row["account_mode"], 0) + cost * rate
+    tax_mode = (account_mode if account_mode != "ALL"
+                else max(by_account, key=by_account.get) if by_account else "US_TAXABLE")
+
+    result = portfolio_return(positions, tax_mode, engine(), ytd_income())
+    return {"fx": fx, "fx_date": fx_date, "result": result, "no_price": missing,
+            "tax_mode": tax_mode,
+            "accounts": [{"mode": k, "label": next((m for m in MODES if m == k), k),
+                          "cost_krw": round(v)} for k, v in sorted(by_account.items())]}
 
 
 def adj_series(ticker: str) -> list:
@@ -558,7 +592,12 @@ def adj_series(ticker: str) -> list:
 
 
 class ProjectionReq(BaseModel):
-    monthly_krw: float = Field(gt=0)
+    """적립 시뮬레이션 요청.
+
+    금액은 **달러 기준**이다. 10년 뒤 환율은 알 수 없고, 과거 환율로 굴리면
+    환율 추세가 섞여 종목 비교가 오염된다. 원화는 현재 환율을 곱한 참고값으로만 준다.
+    """
+    monthly_usd: float = Field(gt=0)
     years: int = Field(gt=0, le=30)
     tickers: list[str]
     with_benchmark: bool = True
@@ -600,10 +639,12 @@ def projection(req: ProjectionReq):
                  f"기간을 줄여보세요.")
 
     since = common_start(eligible)
+    names = {r["ticker"]: r["name"] for r in
+             rows("SELECT ticker, name FROM etf_master")}
     results = []
     for ticker, series in eligible.items():
         try:
-            results.append(simulate(ticker, series, req.monthly_krw,
+            results.append(simulate(ticker, series, req.monthly_usd,
                                     req.years, since=since))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -612,9 +653,13 @@ def projection(req: ProjectionReq):
         raise HTTPException(422, f"수정종가 데이터가 없습니다: {', '.join(missing)}")
 
     payload = compare_projections(results)
+    fx, fx_date = latest_fx()
     return {
-        "monthly_krw": req.monthly_krw, "years": req.years,
-        "total_invested_krw": round(req.monthly_krw * req.years * 12),
+        "monthly_usd": req.monthly_usd, "years": req.years,
+        "total_invested_usd": round(req.monthly_usd * req.years * 12, 2),
+        "fx": fx, "fx_date": fx_date,
+        "fx_note": (f"원화 금액은 현재 환율 {fx:,.1f}원을 곱한 참고값입니다. "
+                    "환율 변동은 반영하지 않았습니다."),
         "benchmarks": benchmarks, "no_data": missing,
         "common_start": since,
         "excluded_short_history": too_short,
@@ -624,19 +669,22 @@ def projection(req: ProjectionReq):
                         + (f" 상장이 늦어 제외한 종목: {', '.join(too_short)}"
                            if too_short else "")),
         "results": [{
-            "ticker": p.ticker, "is_benchmark": p.ticker in benchmarks,
+            "ticker": p.ticker,
+            "name": names.get(p.ticker, ""),
+            "is_benchmark": p.ticker in benchmarks,
             "windows": p.windows,
-            "median_final_krw": p.median_final_krw,
-            "median_profit_krw": p.median_profit_krw,
+            "median_final_usd": round(p.median_final_krw, 2),
+            "median_final_krw": round(p.median_final_krw * fx),
+            "median_profit_usd": round(p.median_profit_krw, 2),
+            "median_profit_krw": round(p.median_profit_krw * fx),
             "median_return_pct": p.median_return_pct,
             "median_annual_pct": p.median_annual_pct,
-            "worst_final_krw": round(p.worst.final_value) if p.worst else None,
-            "best_final_krw": round(p.best.final_value) if p.best else None,
+            "worst_final_usd": round(p.worst.final_value, 2) if p.worst else None,
+            "best_final_usd": round(p.best.final_value, 2) if p.best else None,
             "worst_start": p.worst.start if p.worst else None,
             "loss_windows": p.loss_windows,
             "notes": p.notes,
         } for p in payload.get("items", results)],
-        "spread_krw": payload.get("spread_krw"),
     }
 
 
@@ -657,6 +705,87 @@ def quality(ticker: str, years: int = 5):
             "benchmarks": bench, "vs_spy_pp": gap,
             "note": ("연평균 총수익이 SPY보다 낮다면, 배당을 받아도 시장을 그냥 사는 것보다 "
                      "못한 결과입니다." if gap is not None and gap < 0 else None)}
+
+
+@app.get("/reconcile")
+def reconcile(account_mode: str = "US_TAXABLE"):
+    """매수기록 합계와 증권사 실제 잔고를 대조한다.
+
+    지금은 매도를 반영하지 않는다. 팔았는데 기록에 남아 있으면 보유수량이
+    실제보다 많게 계산되므로, 틀린 숫자를 조용히 보여주는 대신 여기서 잡아낸다.
+    액면분할·무상증자처럼 주문 없이 수량이 바뀌는 경우도 걸린다.
+    """
+    if account_mode not in MODES:
+        raise HTTPException(400, f"계좌모드는 {MODES} 중 하나여야 합니다")
+
+    booked = {r["ticker"]: float(r["qty"]) for r in rows(
+        """SELECT ticker, SUM(qty) AS qty FROM purchase
+           WHERE account_mode=%s GROUP BY ticker HAVING SUM(qty) > 0""",
+        (account_mode,))}
+    if not booked:
+        return {"available": False, "reason": "매수기록이 없습니다."}
+
+    try:
+        from collector.sync_toss import (_credentials, fetch_holdings, get_token)
+        cid, secret, account = _credentials()
+        holdings = fetch_holdings(get_token(cid, secret), account)
+    except Exception as exc:                                  # noqa: BLE001
+        return {"available": False,
+                "reason": f"증권사 잔고를 조회하지 못했습니다 ({type(exc).__name__})."}
+
+    actual = {h["symbol"]: float(h.get("quantity") or 0) for h in holdings}
+    tolerance = 0.0001
+    items, mismatched = [], 0
+    for ticker, qty in sorted(booked.items()):
+        real = actual.get(ticker)
+        if real is None:
+            state, note = "missing", "증권사 잔고에 없습니다. 전량 매도했다면 기록을 정리하세요."
+        elif abs(real - qty) <= tolerance:
+            state, note = "ok", ""
+        elif real < qty:
+            state = "sold"
+            note = (f"기록보다 {qty - real:,.4f}주 적습니다. 매도분이 반영되지 않아 "
+                    "보유수량과 수익이 실제보다 크게 나옵니다.")
+        else:
+            state = "short"
+            note = (f"기록보다 {real - qty:,.4f}주 많습니다. "
+                    "`make opening` 으로 기초 잔고를 채우세요.")
+        if state != "ok":
+            mismatched += 1
+        items.append({"ticker": ticker, "booked": round(qty, 6),
+                      "actual": round(real, 6) if real is not None else None,
+                      "diff": round((real - qty), 6) if real is not None else None,
+                      "state": state, "note": note})
+
+    return {"available": True, "mismatched": mismatched, "items": items,
+            "note": ("매도는 아직 반영하지 않습니다. 차이가 있으면 그만큼 "
+                     "수익이 실제와 다릅니다." if mismatched else "실제 잔고와 일치합니다.")}
+
+
+@app.post("/sync/toss")
+def sync_toss_now():
+    """지금 불러오기. cron 과 별개로, 방금 산 걸 바로 보고 싶을 때 쓴다."""
+    from collector.sync_toss import main as run_sync
+    import io
+    import contextlib
+
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = run_sync([])
+    except Exception as exc:                                  # noqa: BLE001
+        raise HTTPException(502, f"동기화 실패: {type(exc).__name__}") from exc
+
+    output = buffer.getvalue()
+    added = 0
+    for line in output.splitlines():
+        if "신규 매수" in line:
+            digits = [w for w in line.replace("건", " ").split() if w.isdigit()]
+            if len(digits) >= 2:
+                added = int(digits[-1])
+    if code != 0:
+        raise HTTPException(502, output.strip().splitlines()[-1] if output else "동기화 실패")
+    return {"added": added, "log": output.strip()}
 
 
 @app.get("/sync/status")
@@ -763,13 +892,18 @@ def alert_history(limit: int = 30):
 
 # ---------- 배당예상일지 ----------
 @app.get("/calendar")
-def dividend_calendar(account_mode: str = "US_TAXABLE", months: int = 12):
+def dividend_calendar(account_mode: str = "ALL", months: int = 12):
     """앞으로 12개월 월별 입금 예정. 확정분과 추정분을 구분해서 돌려준다."""
-    if account_mode not in MODES:
-        raise HTTPException(400, f"계좌모드는 {MODES} 중 하나여야 합니다")
-    owned = rows("""SELECT ticker, SUM(qty) AS qty FROM purchase
-                    WHERE account_mode=%s GROUP BY ticker HAVING SUM(qty)>0""",
-                 (account_mode,))
+    if account_mode != "ALL" and account_mode not in MODES:
+        raise HTTPException(400, f"계좌모드는 ALL 또는 {MODES} 중 하나여야 합니다")
+    if account_mode == "ALL":
+        owned = rows("""SELECT ticker, SUM(qty) AS qty FROM purchase
+                        GROUP BY ticker HAVING SUM(qty)>0""")
+        account_mode = "US_TAXABLE"
+    else:
+        owned = rows("""SELECT ticker, SUM(qty) AS qty FROM purchase
+                        WHERE account_mode=%s GROUP BY ticker HAVING SUM(qty)>0""",
+                     (account_mode,))
     if not owned:
         return {"empty": True, "message": "매수기록이 없어 일지를 만들 수 없습니다."}
 
