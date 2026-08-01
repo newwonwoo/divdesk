@@ -40,7 +40,7 @@ def imports() -> bool:
     mods = ["collector.sources.base", "collector.sources.yahoo",
             "collector.sources.stockanalysis", "collector.sources.naver_kr",
             "collector.store", "collector.run_us", "collector.run_kr", "collector.probe_kr",
-            "engine.tax", "engine.calc", "engine.score", "engine.calendar", "engine.returns",
+            "engine.tax", "engine.calc", "engine.score", "engine.calendar", "engine.returns", "engine.projection",
             "alerts.push", "alerts.run_alerts", "api.main"]
     proc = subprocess.run(
         [sys.executable, "-c", "import " + ", ".join(mods) + "; print('  통과')"],
@@ -238,6 +238,38 @@ eq("평가손익 세금 미부과 안내", any('팔지 않은' in n for n in por
 
 loss = position_return([Lot('L', 100, 100.0, 1400.0)], 90.0, 1400.0, dividends_since=2_000_000)
 eq("시세손실을 배당이 메우는 경우", loss.price_gain_krw < 0 and loss.total_gain_krw > 0, True)
+
+# --- 적립 시뮬레이션 ---
+from engine.projection import simulate, common_start, growth_quality
+from datetime import timedelta as _td
+# 매달 1% 씩 오르는 가상 종목: 12개월 적립하면 원금보다 커야 한다
+rising = [(date(2020,1,1) + _td(days=30*i), 100 * (1.01 ** i)) for i in range(80)]
+p1 = simulate('R', rising, 1_000_000, 3)
+eq("시뮬레이션 구간 생성", p1.windows > 0, True)
+eq("총 투입액", p1.total_invested_krw, 36_000_000)
+eq("상승장이면 원금 초과", p1.median_final_krw > p1.total_invested_krw, True)
+eq("손실 구간 없음", p1.loss_windows, 0)
+eq("최악 <= 중간 <= 최선",
+   p1.worst.final_value <= p1.median.final_value <= p1.best.final_value, True)
+
+falling = [(date(2020,1,1) + _td(days=30*i), 100 * (0.99 ** i)) for i in range(80)]
+p2 = simulate('F', falling, 1_000_000, 3)
+eq("하락장이면 원금 미달", p2.median_final_krw < p2.total_invested_krw, True)
+eq("손실 구간 표시", p2.loss_windows > 0, True)
+
+short = [(date(2025,1,1) + _td(days=30*i), 100.0) for i in range(10)]
+p3 = simulate('S', short, 1_000_000, 5)
+eq("이력 부족은 계산 안 함", p3.windows, 0)
+eq("부족 사유 안내", any('필요한데' in n for n in p3.notes), True)
+
+# 공통 시작일: 늦게 상장한 쪽에 맞춰야 비교가 공정하다
+eq("공통 시작 = 가장 늦은 상장",
+   common_start({'old': rising, 'new': [(date(2024,1,1), 100.0)]}), date(2024,1,1))
+
+gq = growth_quality(rising, 5)
+eq("상승 종목은 CAGR 양수", gq["cagr_pct"] > 0, True)
+eq("상승 종목은 낙폭 0", gq["mdd_pct"], 0.0)
+eq("하락 종목은 CAGR 음수", growth_quality(falling, 5)["cagr_pct"] < 0, True)
 
 # --- 알람 문구 ---
 from alerts.run_alerts import grade_label, trim

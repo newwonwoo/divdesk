@@ -92,29 +92,51 @@ KR = [
       "note": "국내주식 액티브. 당초 RISE 미국배당100으로 잘못 등록했던 코드"}),
 ]
 
-# 총보수(연, %). 2026-08-01 FunETF(금융투자협회·코스콤 제공) 조회.
+# 미국 총보수(연, %)·순자산(십억달러). 2026-08-01 stockanalysis.com 조회.
+BENCHMARKS = [
+    ("SPY", "SPDR S&P 500 ETF Trust", "State Street", "벤치마크", "Q", 4,
+     {"note": "시장 기준. 유닛투자신탁 구조라 배당 재투자가 안 돼 총수익은 VOO보다 미세하게 뒤진다"}),
+    ("VOO", "Vanguard S&P 500 ETF", "Vanguard", "벤치마크", "Q", 4,
+     {"note": "S&P500 총수익 비교용. SPY보다 보수가 낮고 배당 드래그가 없다"}),
+    ("QQQ", "Invesco QQQ Trust", "Invesco", "벤치마크", "Q", 4,
+     {"note": "나스닥100. JEPQ·QYLD의 기초자산이라 커버드콜 성과 비교에 필요"}),
+]
+
+BENCH_FEES = {"SPY": 0.09, "VOO": 0.03, "QQQ": 0.20}
+
+US_FEES = {'SCHD': 0.06, 'VYM': 0.04, 'VIG': 0.04, 'DGRO': 0.08, 'DVY': 0.38, 'SDY': 0.35, 'NOBL': 0.35, 'HDV': 0.08, 'FDVV': 0.15, 'SCHY': 0.08, 'VYMI': 0.07, 'VNQ': 0.13, 'DGRW': 0.28, 'SPHD': 0.3, 'PFF': 0.45, 'DIV': 0.45, 'JEPI': 0.35, 'JEPQ': 0.35, 'QYLD': 0.6, 'XYLD': 0.6, 'RYLD': 0.6}
+US_AUM = {'SCHD': 103.72, 'VYM': 81.51, 'VIG': 111.71, 'DGRO': 42.86, 'DVY': 23.59, 'SDY': 23.53, 'NOBL': 11.7, 'HDV': 14.83, 'FDVV': 10.17, 'SCHY': 2.5, 'VYMI': 21.07, 'VNQ': 39.51, 'DGRW': 16.61, 'SPHD': 4.04, 'PFF': 13.18, 'DIV': 0.787, 'JEPI': 45.34, 'JEPQ': 38.86, 'QYLD': 8.03, 'XYLD': 3.21, 'RYLD': 1.36}
+
+# 국내 총보수(연, %). 2026-08-01 FunETF(금융투자협회·코스콤 제공) 조회.
 KR_FEES = {'458730': 0.01, '446720': 0.01, '402970': 0.01, '489250': 0.0099, '458760': 0.39, '441640': 0.19, '161510': 0.23, '279530': 0.3, '329200': 0.08, '476850': 0.5}
 
 
 SQL = """INSERT INTO etf_master
  (ticker,market,name,issuer,strategy,pay_freq,pays_per_year,is_covered_call,
-  kr_alt_ticker,tags,expense_ratio)
- VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+  kr_alt_ticker,tags,expense_ratio,is_benchmark)
+ VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
  ON CONFLICT (ticker) DO UPDATE SET
    name=EXCLUDED.name, issuer=EXCLUDED.issuer, strategy=EXCLUDED.strategy,
    pay_freq=EXCLUDED.pay_freq, pays_per_year=EXCLUDED.pays_per_year,
    is_covered_call=EXCLUDED.is_covered_call, kr_alt_ticker=EXCLUDED.kr_alt_ticker,
-   tags=EXCLUDED.tags, expense_ratio=EXCLUDED.expense_ratio, updated_at=now()"""
+   tags=EXCLUDED.tags, expense_ratio=EXCLUDED.expense_ratio,
+   is_benchmark=EXCLUDED.is_benchmark, updated_at=now()"""
 
 
 def rows() -> list[tuple]:
     out = []
+    for tk, name, issuer, strat, freq, pays, tags in BENCHMARKS:
+        out.append((tk, "US", name, issuer, strat, freq, pays, False, None,
+                    json.dumps(tags), BENCH_FEES.get(tk), True))
     for tk, name, issuer, strat, freq, pays, cc, alt, tags in US:
+        enriched = dict(tags)
+        if tk in US_AUM:
+            enriched["aum_busd"] = US_AUM[tk]
         out.append((tk, "US", name, issuer, strat, freq, pays, cc, alt,
-                    json.dumps(tags), None))
+                    json.dumps(enriched), US_FEES.get(tk), False))
     for tk, name, issuer, strat, freq, pays, cc, tags in KR:
         out.append((tk, "KR", name, issuer, strat, freq, pays, cc, None,
-                    json.dumps(tags), KR_FEES.get(tk)))
+                    json.dumps(tags), KR_FEES.get(tk), False))
     return out
 
 
@@ -133,7 +155,7 @@ def main(dsn: str | None = None) -> int:
             for market, cnt in cur.fetchall():
                 print(f"  {market}: {cnt}종목")
     print(f"시딩 완료 {len(data)}건")
-    print("국내 지수·운용사·총보수 확인 완료(2026-08-01 기준). 미국 종목 보수는 미입력.")
+    print("국내 지수·운용사·총보수 확인 완료(2026-08-01 기준). 미국 종목 보수도 반영.")
     return 0
 
 
