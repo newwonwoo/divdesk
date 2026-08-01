@@ -1,18 +1,26 @@
 const BASE = import.meta.env.VITE_API_BASE || '/api'
 
+const TOKEN = import.meta.env.VITE_API_TOKEN || ''
+
 async function req(path, options = {}) {
   const res = await fetch(BASE + path, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(TOKEN ? { 'X-DivDesk-Token': TOKEN } : {}),
+      ...(options.headers || {}),
+    },
   })
   let body = null
   try { body = await res.json() } catch { /* 본문 없는 응답 */ }
   if (!res.ok) {
     // 서버가 왜 거절했는지 그대로 보여준다. 삼키지 않는다.
     const detail = body?.detail
-    const msg = Array.isArray(detail)
-      ? detail.map(d => d.msg).join(', ')
-      : (detail || `요청 실패 (${res.status})`)
+    const msg = res.status === 401
+      ? '접근 토큰이 맞지 않습니다. 배포 환경변수를 확인하세요.'
+      : Array.isArray(detail)
+        ? detail.map(d => d.msg).join(', ')
+        : (detail || `요청 실패 (${res.status})`)
     throw new Error(msg)
   }
   return body

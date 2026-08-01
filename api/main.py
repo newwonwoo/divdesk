@@ -31,11 +31,32 @@ from alerts import push
 
 app = FastAPI(title="DivDesk API", version="0.1.0")
 
+# 접근 토큰. .env 의 DIVDESK_TOKEN 과 대조한다.
+#
+# 이건 '인증'이 아니라 '자물쇠 하나'다. 프론트 코드에 들어가므로 개발자도구를
+# 열면 보인다. 막아주는 것은 주소를 긁어 다니는 스캐너 봇이지, 마음먹은 사람이 아니다.
+# 매수기록은 토스에서 매일 다시 받아오므로 지워져도 복구되지만,
+# 보유 종목과 금액은 토큰을 아는 사람에게 그대로 보인다는 점을 전제로 쓴다.
+TOKEN = os.environ.get("DIVDESK_TOKEN", "").strip()
+OPEN_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def check_token(request, call_next):
+    if not TOKEN or request.method == "OPTIONS" or request.url.path in OPEN_PATHS:
+        return await call_next(request)
+    sent = (request.headers.get("X-DivDesk-Token")
+            or request.query_params.get("token", ""))
+    if sent != TOKEN:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "접근 토큰이 필요합니다"}, status_code=401)
+    return await call_next(request)
+
 origins = [o for o in os.environ.get("DIVDESK_ORIGINS", "").split(",") if o]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins or ["http://localhost:5173"],
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -152,6 +173,7 @@ def engine() -> TaxEngine:
 # ---------- 조회 ----------
 @app.get("/health")
 def health():
+    """토큰 없이 열어둔다. 서버가 살아있는지 확인하는 데 비밀이 필요하지 않다."""
     try:
         rows("SELECT 1 AS ok")
         return {"ok": True, "db": True}
