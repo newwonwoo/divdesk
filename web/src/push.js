@@ -4,7 +4,8 @@
 // 브라우저 탭에서는 Notification.requestPermission 자체가 없거나 구독이 실패한다.
 // 그래서 상태를 구분해 돌려주고, 화면에서 그에 맞는 안내를 띄운다.
 
-const TOKEN = import.meta.env.VITE_API_TOKEN || ''
+const TOKEN = (import.meta.env.VITE_API_TOKEN || '')
+  .replace(/[\r\n\t]/g, '').replace(/^["']|["']$/g, '').trim()
 const api = (p, o = {}) => fetch((import.meta.env.VITE_API_BASE || '/api') + p, {
   ...o,
   headers: { ...(o.headers || {}), ...(TOKEN ? { 'X-DivDesk-Token': TOKEN } : {}) },

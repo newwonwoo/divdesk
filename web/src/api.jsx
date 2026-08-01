@@ -1,6 +1,11 @@
-const BASE = import.meta.env.VITE_API_BASE || '/api'
+const BASE = import.meta.env.VITE_API_BASE || '/api'   // Vercel 프록시 경유(HTTPS)
 
-const TOKEN = import.meta.env.VITE_API_TOKEN || ''
+// 환경변수에 붙여넣다 보면 줄바꿈·따옴표·공백이 딸려 온다.
+// 그대로 헤더에 넣으면 브라우저가 fetch 자체를 거부한다("Invalid value").
+const TOKEN = (import.meta.env.VITE_API_TOKEN || '')
+  .replace(/[\r\n\t]/g, '')
+  .replace(/^["']|["']$/g, '')
+  .trim()
 
 async function req(path, options = {}) {
   const res = await fetch(BASE + path, {
