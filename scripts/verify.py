@@ -40,6 +40,7 @@ def imports() -> bool:
     mods = ["collector.sources.base", "collector.sources.yahoo",
             "collector.sources.stockanalysis", "collector.sources.naver_kr",
             "collector.store", "collector.run_us", "collector.run_kr", "collector.probe_kr",
+            "collector.sync_toss",
             "engine.tax", "engine.calc", "engine.score", "engine.calendar", "engine.returns", "engine.projection",
             "alerts.push", "alerts.run_alerts", "api.main"]
     proc = subprocess.run(
@@ -137,6 +138,26 @@ eq("월배당 주기 도출", infer_pays_per_year(mk(30, 14)), 12)
 eq("분기배당 주기 도출", infer_pays_per_year(mk(91, 10)), 4)
 eq("이력 부족시 판단 보류", infer_pays_per_year(mk(30, 2)), None)
 eq("국내 심볼 변환", symbol('458730'), '458730.KS')
+
+# --- 토스 주문 변환 ---
+from collector.sync_toss import to_purchase, account_mode
+buy = {"orderId": "abc", "symbol": "SCHD", "side": "BUY", "currency": "USD",
+       "orderedAt": "2026-07-24T09:30:00+09:00",
+       "execution": {"filledQuantity": "120", "averageFilledPrice": "28.4",
+                     "commission": "0.5", "filledAt": "2026-07-24T22:31:00+09:00"}}
+got = to_purchase(buy)
+eq("매수 주문 변환", (got["ticker"], got["qty"], got["price"]), ("SCHD", 120.0, 28.4))
+eq("체결일 기준 날짜", got["trade_date"], date(2026, 7, 24))
+eq("수수료 반영", got["fee"], 0.5)
+
+sell = dict(buy, side="SELL")
+eq("매도는 제외", to_purchase(sell), None)
+unfilled = dict(buy, execution={"filledQuantity": "0", "averageFilledPrice": None})
+eq("미체결은 제외", to_purchase(unfilled), None)
+no_price = dict(buy, execution={"filledQuantity": "5", "averageFilledPrice": None})
+eq("체결가 없으면 제외", to_purchase(no_price), None)
+eq("미국은 해외 계좌모드", account_mode("US"), "US_TAXABLE")
+eq("국내는 국내 계좌모드", account_mode("KR"), "KR_TAXABLE")
 
 # --- 캘린더 엔진 ---
 from engine.calendar import TradingCalendar, predict_schedule, monthly_ledger
