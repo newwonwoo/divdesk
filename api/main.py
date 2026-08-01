@@ -137,6 +137,17 @@ def load_holdings(tickers: list[str]) -> list[Holding]:
     return found
 
 
+def norm_mode(value: str | None, default: str = "ALL") -> str:
+    """계좌모드 정규화.
+
+    프론트에서 값이 안 넘어오면 문자열 "undefined" 가 그대로 붙어 온다.
+    그걸 400 으로 튕기면 화면이 통째로 빈다. 명백한 빈 값은 기본값으로 받아준다.
+    """
+    if not value or value in ("undefined", "null", "ALL"):
+        return default
+    return value
+
+
 _CAL_CACHE: dict = {}
 
 
@@ -374,6 +385,7 @@ def delete_purchase(purchase_id: int):
 # ---------- 포트폴리오 / 워치독 ----------
 @app.get("/portfolio")
 def portfolio(account_mode: str = "ALL"):
+    account_mode = norm_mode(account_mode)
     if account_mode != "ALL" and account_mode not in MODES:
         raise HTTPException(400, f"계좌모드는 ALL 또는 {MODES} 중 하나여야 합니다")
     if account_mode == "ALL":
@@ -515,6 +527,7 @@ def portfolio_returns(account_mode: str = "ALL"):
     기본은 전 계좌 합산이다. 내 자산은 하나인데 계좌별로 나눠 보여주면
     계좌를 바꿀 때마다 자산이 사라졌다 나타나 혼란스럽다.
     """
+    account_mode = norm_mode(account_mode)
     if account_mode != "ALL" and account_mode not in MODES:
         raise HTTPException(400, f"계좌모드는 ALL 또는 {MODES} 중 하나여야 합니다")
 
@@ -894,6 +907,7 @@ def alert_history(limit: int = 30):
 @app.get("/calendar")
 def dividend_calendar(account_mode: str = "ALL", months: int = 12):
     """앞으로 12개월 월별 입금 예정. 확정분과 추정분을 구분해서 돌려준다."""
+    account_mode = norm_mode(account_mode)
     if account_mode != "ALL" and account_mode not in MODES:
         raise HTTPException(400, f"계좌모드는 ALL 또는 {MODES} 중 하나여야 합니다")
     if account_mode == "ALL":
