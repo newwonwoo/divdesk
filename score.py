@@ -1,287 +1,260 @@
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DivDesk 목업 — 배당ETF 매수검토기</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
-<style>
-:root{
-  --ink:#0F1E3D;        /* 통장 잉크 */
-  --ink-2:#4A5872;
-  --paper:#E9EDF2;      /* 명세서 용지 */
-  --card:#FFFFFF;
-  --rule:#C8D1DD;       /* 괘선 */
-  --in:#0E6F63;         /* 입금(배당) */
-  --out:#A63A18;        /* 차감(세금·배당락) */
-  --gold:#8A6D1F;       /* 관망 */
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  background:var(--paper);color:var(--ink);
-  font-family:Pretendard,-apple-system,sans-serif;
-  font-size:15px;line-height:1.5;
-  padding-bottom:80px;
-}
-.num{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums}
-.wrap{max-width:460px;margin:0 auto;padding:0 16px}
+# 품질확인서 — 스코어 백테스트 (as-of 채점기)
 
-/* 헤더 */
-header{padding:20px 0 14px}
-.brand{display:flex;align-items:baseline;gap:8px}
-.brand h1{font-size:19px;font-weight:800;letter-spacing:-.03em}
-.brand span{font-size:11px;color:var(--ink-2);letter-spacing:.08em}
-.asof{margin-top:4px;font-size:11px;color:var(--ink-2)}
+작성일 2026-08-02 · 대상 커밋: `engine/asof.py`, `scripts/backtest.py`,
+`scripts/bt_report.py`, `scripts/bt_price.py`, `api/main.py`(recompute 전환, 미배포)
 
-/* 계좌모드 세그먼트 */
-.seg{display:flex;border:1px solid var(--ink);border-radius:2px;overflow:hidden;margin-top:14px}
-.seg button{flex:1;padding:9px 4px;font-size:12px;font-weight:600;background:transparent;
-  border:0;border-right:1px solid var(--rule);color:var(--ink-2);cursor:pointer;font-family:inherit}
-.seg button:last-child{border-right:0}
-.seg button[aria-selected=true]{background:var(--ink);color:#fff}
+---
 
-/* 카드 */
-.card{background:var(--card);border:1px solid var(--rule);border-radius:3px;padding:16px;margin-top:14px}
-.card h2{font-size:12px;font-weight:700;letter-spacing:.1em;color:var(--ink-2);
-  text-transform:uppercase;display:flex;align-items:center;gap:6px;margin-bottom:12px}
+## 1. 무엇을 하려고 했나
 
-/* ⓘ 버튼 */
-.info{width:17px;height:17px;border-radius:50%;border:1px solid var(--rule);
-  background:#fff;color:var(--ink-2);font-size:11px;font-weight:700;line-height:1;
-  cursor:pointer;flex:0 0 auto;font-family:inherit}
-.info:hover,.info:focus-visible{background:var(--ink);color:#fff;border-color:var(--ink);outline:none}
+지금까지 스코어 로직을 여러 번 고쳤지만 **실제로 나은지 검증한 적이 없었다.**
+과거 시점으로 돌아가 그 시점 데이터만으로 점수를 내고, 이후 실제 수익과
+맞춰보는 것이 이번 작업의 목적이다. 특히 **타점(매수 타이밍)** 이 진짜 예측력을
+가지는지가 핵심 질문이었다. 품질은 과거 성과로 계산하므로 미래 성과와 상관이
+나오는 것이 당연할 수 있다(순환 논리).
 
-/* 입력 */
-label{display:block;font-size:12px;color:var(--ink-2);margin-bottom:5px}
-.field{display:flex;align-items:center;border-bottom:1.5px solid var(--ink);padding-bottom:6px}
-.field input{flex:1;border:0;background:transparent;font-size:24px;font-weight:700;
-  text-align:right;color:var(--ink);outline:none;font-family:'JetBrains Mono',monospace}
-.field em{font-style:normal;font-size:13px;color:var(--ink-2);padding-left:6px}
-.dir{display:flex;gap:0;margin-bottom:16px}
-.dir button{flex:1;padding:8px;font-size:12.5px;font-weight:600;background:#fff;font-family:inherit;
-  border:1px solid var(--rule);color:var(--ink-2);cursor:pointer}
-.dir button[aria-selected=true]{background:#DDE6E4;border-color:var(--in);color:var(--in)}
+## 2. 요구사항 대조표
 
-/* 결과 큰 숫자 */
-.result{margin-top:18px;padding-top:14px;border-top:1px dashed var(--rule)}
-.result .big{font-family:'JetBrains Mono',monospace;font-size:34px;font-weight:700;
-  letter-spacing:-.02em;color:var(--in);line-height:1.1}
-.result .lbl{font-size:11.5px;color:var(--ink-2);letter-spacing:.04em}
-.rows{margin-top:12px;font-size:13px}
-.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dotted var(--rule)}
-.row:last-child{border-bottom:0}
-.row span:first-child{color:var(--ink-2)}
-.minus{color:var(--out)}
+| # | 요구사항 | 결과 | 근거 |
+|---|---|---|---|
+| 1 | 과거 시점에서 알 수 있던 정보만 사용 | 충족 | `engine/asof.py` 전 창을 `≤ as_of` 로 절단. `scripts/test_asof.py` 가 "미래를 잘라내도 점수 불변" 을 검증 |
+| 2 | 프로덕션과 같은 채점기로 검증 | 충족 | 조립을 `engine/asof.build_input()` 한 곳으로 모으고 `recompute()` 도 이 경로를 쓰도록 전환 |
+| 3 | 타점 검증을 우선 | 충족 | 동일종목 내 비교(품질 교란 제거) + 횡단면 분위 + 순수 가격위치 확장 검증 |
+| 4 | 시장 국면별 분리 | 충족 | 벤치 200일선 기울기 부호로 up/down 분리. 커버드콜 별도 집계 |
+| 5 | 무단 절단 금지 | 충족 | 미래 구간 부족분은 값만 공란 처리하고 **건수를 출력** |
+| 6 | 품질 축 검증 | **미충족** | 배당 이력이 2020년부터라 과거 시점에서 3·5년 CAGR 재구성 불가 (5절) |
+| 7 | 배당락 낙폭 항목 검증 | **미충족** | `etf_price_daily` 에 `open` 컬럼이 없어 낙폭 산출 불가 → 전 구간 중립 처리 |
 
-/* 시그니처: 12개월 입금 스트립 */
-.strip{display:flex;gap:3px;align-items:flex-end;height:96px;margin-top:6px}
-.mo{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px}
-.bar{width:100%;background:var(--in);border-radius:1px 1px 0 0}
-.bar.est{background:repeating-linear-gradient(-45deg,#0E6F63,#0E6F63 3px,#7FAEA8 3px,#7FAEA8 6px)}
-.mo b{font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:400;color:var(--ink-2)}
-.legend{display:flex;gap:12px;font-size:10.5px;color:var(--ink-2);margin-top:8px}
-.legend i{display:inline-block;width:9px;height:9px;margin-right:4px;vertical-align:-1px}
+## 3. 검증 4단계 결과
 
-/* 종목 카드 */
-.etf{display:flex;gap:12px;padding:13px 0;border-bottom:1px solid var(--rule);align-items:center}
-.etf:last-child{border-bottom:0}
-.score{width:46px;height:46px;flex:0 0 auto;border-radius:2px;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;color:#fff}
-.score b{font-family:'JetBrains Mono',monospace;font-size:19px;line-height:1}
-.score s{text-decoration:none;font-size:8.5px;letter-spacing:.06em}
-.s-buy{background:var(--in)}.s-hold{background:var(--gold)}.s-wait{background:#7A8598}
-.etf-main{flex:1;min-width:0}
-.tk{font-weight:800;font-size:15px;letter-spacing:-.01em}
-.tk small{font-weight:500;font-size:11.5px;color:var(--ink-2);margin-left:6px}
-.why{font-size:11.5px;color:var(--ink-2);margin-top:3px}
-.badge{display:inline-block;font-size:9.5px;font-weight:700;padding:2px 5px;margin-top:5px;
-  border:1px solid var(--out);color:var(--out);border-radius:2px}
-.yld{text-align:right;flex:0 0 auto}
-.yld b{font-family:'JetBrains Mono',monospace;font-size:15px}
-.yld s{display:block;text-decoration:none;font-size:9.5px;color:var(--ink-2)}
+`make verify` 전 단계 통과 (문법 / import / 목 실행 / pyflakes 지적 0건).
+추가로 `scripts/test_asof.py` 를 새로 만들어 **look-ahead 차단**을 단위 검증했다.
+합성 시계열로 D 이후를 잘라낸 패널과 전체 패널의 채점 결과가 종합·품질·타점
+모두 일치함을 확인했다. 이것이 이 작업에서 가장 중요한 안전장치다 —
+미래를 훔쳐보면 어떤 점수든 예측력이 있는 것처럼 보이기 때문이다.
 
-/* 매수기록 */
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{text-align:left;font-size:10px;letter-spacing:.08em;color:var(--ink-2);font-weight:600;
-  padding:0 0 7px;border-bottom:1px solid var(--ink)}
-td{padding:9px 0;border-bottom:1px dotted var(--rule)}
-td.n{text-align:right;font-family:'JetBrains Mono',monospace}
-.warn{margin-top:14px;padding:11px 13px;background:#FBF0EA;border-left:3px solid var(--out);font-size:12px}
+## 4. 실측 결과
 
-/* 하단 탭 */
-nav{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--rule);display:flex}
-nav button{flex:1;padding:11px 0 13px;background:none;border:0;font-family:inherit;
-  font-size:11px;font-weight:600;color:var(--ink-2);cursor:pointer}
-nav button[aria-selected=true]{color:var(--in);box-shadow:inset 0 2px 0 var(--in)}
-.page{display:none}.page.on{display:block}
+### 4-1. 전체 스코어 (2016~2026, 관측 1,505 / 31종, 12개월 수익)
 
-/* 바텀시트 */
-.sheet{position:fixed;inset:0;background:rgba(15,30,61,.45);display:none;align-items:flex-end;z-index:9}
-.sheet.on{display:flex}
-.sheet-in{background:#fff;width:100%;max-width:460px;margin:0 auto;padding:20px 18px 26px;
-  border-radius:8px 8px 0 0}
-.sheet h3{font-size:15px;font-weight:800;margin-bottom:9px}
-.sheet p{font-size:13px;color:#28344B;margin-bottom:9px}
-.sheet code{font-family:'JetBrains Mono',monospace;font-size:11.5px;background:var(--paper);
-  padding:2px 5px;display:inline-block}
-.sheet button{margin-top:6px;width:100%;padding:11px;background:var(--ink);color:#fff;
-  border:0;border-radius:2px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}
-@media(prefers-reduced-motion:no-preference){.sheet.on .sheet-in{animation:up .2s ease}}
-@keyframes up{from{transform:translateY(14px)}}
-</style>
-</head>
-<body>
-<div class="wrap">
-<header>
-  <div class="brand"><h1>DivDesk</h1><span>배당ETF 매수검토</span></div>
-  <div class="asof num">데이터 기준 2026-07-30 · USD/KRW 1,378.40 · 아래 숫자는 전부 더미</div>
-  <div class="seg" role="tablist">
-    <button role="tab" aria-selected="true">일반·미국상장</button>
-    <button role="tab" aria-selected="false">일반·국내상장</button>
-    <button role="tab" aria-selected="false">절세계좌</button>
-  </div>
-</header>
+| 구분 | 최상위−최하위 분위 | 상관 | 동일종목 내 |
+|---|---|---|---|
+| 타점 | +4.6% | +0.196 | **+0.0%** (양 17/28종) |
+| 종합 | +8.8% | +0.206 | — |
 
-<!-- 계산기 -->
-<section class="page on" id="p1">
-  <div class="card">
-    <h2>계산 방향 <button class="info" onclick="sheet('dir')">i</button></h2>
-    <div class="dir">
-      <button aria-selected="true">금액 → 월배당</button>
-      <button aria-selected="false">월배당 → 필요금액</button>
-    </div>
-    <label>투자 원금</label>
-    <div class="field"><input value="50,000,000" inputmode="numeric"><em>원</em></div>
+벤치(SPY·VOO·QQQ) 12개월 평균 **+15.7%** 로, 후보의 어느 타점 분위보다 높다.
 
-    <div class="result">
-      <div class="lbl">세후 월평균 배당 <button class="info" onclick="sheet('avg')">i</button></div>
-      <div class="big">168,420원</div>
-      <div class="rows">
-        <div class="row"><span>연 세전 배당</span><b class="num">2,384,000원</b></div>
-        <div class="row"><span>미국 원천징수 15%</span><b class="num minus">-357,600원</b></div>
-        <div class="row"><span>국내 추가납부</span><b class="num">0원</b></div>
-        <div class="row"><span>가중 배당률</span><b class="num">4.77%</b></div>
-      </div>
-    </div>
-  </div>
+### 4-2. 순수 가격위치 확장 (2017~2026, 관측 2,372 / 31종)
 
-  <div class="card">
-    <h2>월별 실제 입금 <button class="info" onclick="sheet('strip')">i</button></h2>
-    <div class="strip">
-      <div class="mo"><div class="bar" style="height:22%"></div><b>1</b></div>
-      <div class="mo"><div class="bar" style="height:24%"></div><b>2</b></div>
-      <div class="mo"><div class="bar" style="height:88%"></div><b>3</b></div>
-      <div class="mo"><div class="bar" style="height:23%"></div><b>4</b></div>
-      <div class="mo"><div class="bar" style="height:25%"></div><b>5</b></div>
-      <div class="mo"><div class="bar est" style="height:91%"></div><b>6</b></div>
-      <div class="mo"><div class="bar est" style="height:24%"></div><b>7</b></div>
-      <div class="mo"><div class="bar est" style="height:23%"></div><b>8</b></div>
-      <div class="mo"><div class="bar est" style="height:95%"></div><b>9</b></div>
-      <div class="mo"><div class="bar est" style="height:25%"></div><b>10</b></div>
-      <div class="mo"><div class="bar est" style="height:24%"></div><b>11</b></div>
-      <div class="mo"><div class="bar est" style="height:98%"></div><b>12</b></div>
-    </div>
-    <div class="legend">
-      <span><i style="background:#0E6F63"></i>확정</span>
-      <span><i class="bar est" style="height:9px"></i>추정</span>
-      <span>분기배당 종목 때문에 3·6·9·12월에 몰립니다</span>
-    </div>
-  </div>
-</section>
+배당 게이트를 우회해 2018 조정·2020 급락을 포함시킨 검증이다.
 
-<!-- 타점 -->
-<section class="page" id="p2">
-  <div class="card">
-    <h2>오늘의 매수타점 <button class="info" onclick="sheet('score')">i</button></h2>
-    <div class="etf">
-      <div class="score s-buy"><b>88</b><s>적극매수</s></div>
-      <div class="etf-main">
-        <div class="tk">SCHD<small>배당성장·분기</small></div>
-        <div class="why">배당률 5년 상위 11% · 200일선 -6.3% · 배당락 D-42</div>
-      </div>
-      <div class="yld"><b>4.21%</b><s>배당률</s></div>
-    </div>
-    <div class="etf">
-      <div class="score s-buy"><b>79</b><s>매수</s></div>
-      <div class="etf-main">
-        <div class="tk">TIGER 미국배당다우존스<small>월배당</small></div>
-        <div class="why">환율 3년 상위 78%로 감점 · 분배금 12개월 +6.4%</div>
-      </div>
-      <div class="yld"><b>3.98%</b><s>배당률</s></div>
-    </div>
-    <div class="etf">
-      <div class="score s-hold"><b>61</b><s>관망</s></div>
-      <div class="etf-main">
-        <div class="tk">JEPQ<small>커버드콜·월배당</small></div>
-        <div class="why">분배율 10.8%인데 1년 총수익 +1.2% · 배당락 D-3</div>
-        <div class="badge">분배금 ≠ 수익</div>
-      </div>
-      <div class="yld"><b>10.84%</b><s>배당률</s></div>
-    </div>
-    <div class="etf">
-      <div class="score s-wait"><b>44</b><s>보류</s></div>
-      <div class="etf-main">
-        <div class="tk">QYLD<small>커버드콜·월배당</small></div>
-        <div class="why">분배금 3년 -18% · 원금환급 성향 · 52주 상단 92%</div>
-        <div class="badge">분배금 ≠ 수익</div>
-      </div>
-      <div class="yld"><b>11.92%</b><s>배당률</s></div>
-    </div>
-  </div>
-</section>
+| 항목 | 값 |
+|---|---|
+| 5분위 최상위−최하위 | **-2.4%** (단조 아님, U자) |
+| 상관 | **-0.051** |
+| 동일종목 내 | **-3.3%** (양 10/29종) |
+| 국면 up | +0.6% |
+| 국면 down | **-3.1%** |
+| 커버드콜 | -0.9% |
+| 벤치 baseline | +17.2% |
 
-<!-- 매수기록 -->
-<section class="page" id="p3">
-  <div class="card">
-    <h2>매수기록</h2>
-    <table>
-      <tr><th>일자</th><th>종목</th><th style="text-align:right">수량</th><th style="text-align:right">단가</th><th style="text-align:right">평가</th></tr>
-      <tr><td class="num">07-24</td><td>SCHD</td><td class="n">120</td><td class="n">$28.40</td><td class="n" style="color:#0E6F63">+3.1%</td></tr>
-      <tr><td class="num">07-02</td><td>JEPI</td><td class="n">60</td><td class="n">$57.10</td><td class="n" style="color:#A63A18">-1.4%</td></tr>
-      <tr><td class="num">06-18</td><td>TIGER 미국배당다우존스</td><td class="n">400</td><td class="n">11,905원</td><td class="n" style="color:#0E6F63">+2.2%</td></tr>
-    </table>
-    <div class="warn">
-      <b>금융소득 워치독</b><br>
-      올해 누적 세전 금융소득 <span class="num">7,412,000원</span> / 2,000만원 기준 37%.
-      1,600만원 도달 시 절세계좌 이전을 제안합니다.
-    </div>
-  </div>
-</section>
-</div>
+### 4-3. 가격위치 3요소 분해 (2017~2026, 관측 2,372 / 31종)
 
-<nav role="tablist">
-  <button role="tab" aria-selected="true" onclick="go(1,this)">계산</button>
-  <button role="tab" aria-selected="false" onclick="go(2,this)">타점</button>
-  <button role="tab" aria-selected="false" onclick="go(3,this)">기록</button>
-</nav>
+배점 기준. 양(+)이면 그 항목이 점수를 옳은 방향으로 주고 있다는 뜻.
 
-<div class="sheet" id="sh" onclick="if(event.target===this)close_()">
-  <div class="sheet-in">
-    <h3 id="sh-t"></h3>
-    <div id="sh-b"></div>
-    <button onclick="close_()">닫기</button>
-  </div>
-</div>
+| 항목 | 배점 | 성격 | 상관 | 동일종목차 | 양(+) 종목 | 판정 |
+|---|---|---|---|---|---|---|
+| 200일선 기울기 | 8 | 추세추종 | -0.238 | -12.9% | 2/29 | **방향 반대** |
+| 고점 낙폭 | 6 | 역추세 | +0.310 | +13.2% | 28/29 | **방향 맞음** |
+| 20일 변동 | 6 | 역추세 | -0.008 | +3.0% | 25/29 | 약함·비단조 |
 
-<script>
-const DOC={
- dir:["계산 방향","<p>두 방향 모두 같은 세금 규칙을 씁니다.</p><p><b>금액 → 월배당</b>: 원금을 넣으면 세후 월평균과 월별 입금 편차를 보여줍니다.</p><p><b>월배당 → 필요금액</b>: 목표 월배당을 넣으면 필요 원금과 종목별 주수를 역산합니다. 주수는 정수로 내림한 뒤 부족분을 다시 채웁니다.</p>"],
- avg:["세후 월평균 배당은 어떻게 나오나요","<p><code>연 세전배당 ÷ 12 × (1 - 실효세율) × 환율</code></p><p>연 세전배당은 종목별 최근 4회 분배금 합계를 보유 주수에 곱해 더한 값입니다. 예상치가 아니라 이미 지급된 금액 기준입니다.</p><p>미국 상장 ETF는 현지에서 15%를 먼저 떼고, 한국 배당소득세율(14%)보다 높아 통상 추가 납부가 없습니다. 연 금융소득이 2,000만원을 넘으면 종합과세로 넘어가 계산이 달라집니다.</p>"],
- strip:["월별 입금이 왜 들쭉날쭉한가요","<p>분기배당 종목은 3·6·9·12월에만 입금됩니다. 그래서 '월평균'과 '이번 달 실제 입금'은 다릅니다.</p><p>빗금 막대는 아직 공시되지 않은 추정치입니다. 최근 4회 평균에 성장 추세를 반영해 계산하며, 운용사 배당 공시가 나오면 확정으로 바뀝니다.</p>"],
- score:["타점 점수 계산식","<p>두 축입니다. <b>품질은 이 상품이 꾸준한가, 타점은 지금 얼마나 싸게 사는가.</b></p><p><code>배당률 30 · 가격 위치 20 · 분배금 성장 15 · 위험조정 수익 15 · 환율 10 · 배당락 회복력 10</code></p><p>종합은 <b>품질 75% + 타점 25%</b>. 85 이상 적극매수, 70~84 매수, 55~69 분할·관망, 55 미만 보류. 품질이 50점 미만이면 아무리 싸도 제외합니다.</p><p><b>타점 비중이 낮은 이유</b> — 과거 10년으로 검증해 보니 가격으로 매수 시점을 맞히는 힘이 거의 없었습니다. 방향이 맞은 건 고점 대비 낙폭 하나뿐이라, 200일선 추세와 골든크로스는 점수에서 빼고 경고로만 남겼습니다.</p><p><b>가격 위치</b>는 고점 대비 낙폭을 그 종목 자기 이력과 함께 봅니다. 같은 -10%도 평소 -50%씩 빠지던 종목엔 평범하고, -14%가 최대였던 종목엔 역대급이기 때문입니다.</p><p>배당률이 높다고 점수가 오르는 게 아니라, <b>그 종목의 과거 자기 배당률 대비 지금이 싼지</b>를 봅니다. 커버드콜 종목은 분배금 일부가 옵션 프리미엄과 원금환급이라 총수익 항목에서 감점될 수 있습니다.</p>"]
-};
-function sheet(k){document.getElementById('sh-t').textContent=DOC[k][0];
- document.getElementById('sh-b').innerHTML=DOC[k][1];document.getElementById('sh').classList.add('on')}
-function close_(){document.getElementById('sh').classList.remove('on')}
-function go(n,b){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
- document.getElementById('p'+n).classList.add('on');
- document.querySelectorAll('nav button').forEach(x=>x.setAttribute('aria-selected','false'));
- b.setAttribute('aria-selected','true');window.scrollTo(0,0)}
-document.querySelectorAll('.seg button,.dir button').forEach(b=>b.onclick=()=>{
- b.parentNode.querySelectorAll('button').forEach(x=>x.setAttribute('aria-selected','false'));
- b.setAttribute('aria-selected','true')});
-addEventListener('keydown',e=>{if(e.key==='Escape')close_()});
-</script>
-</body>
-</html>
+두 항목 모두 5분위가 단조다. 낙폭은 최상위 +20.8% → 고점 근처 +6.3%,
+기울기는 하락추세 +17.9% → 상승추세 +8.1% 로 **역방향** 단조.
+20일 변동은 U자(양극단이 좋고 중간이 나쁨)라 선형 배점으로 담기지 않는다.
+
+### 4-4. 낙폭 정규화 3방식 + 기간 분할 (2017~2026, 관측 1,661 / 29종)
+
+낙폭 배점의 `-10%` 절대 기준을 '자기 이력 대비' 로 바꾸는 두 안을 현행과 비교.
+값이 클수록 많이 빠진 상태이며, 양(+)이면 그때 사는 게 나았다는 뜻.
+
+| 방식 | 전체 상관 | 동일종목차 | 양(+) | ~2021 | 2022~ |
+|---|---|---|---|---|---|
+| A 현행 (-10% 만점) | +0.319 | +13.2% | 23/23 | **+0.566** | **+0.022** |
+| B 최대낙폭 대비 | +0.306 | +11.1% | 22/23 | +0.450 | +0.121 |
+| C 낙폭 백분위 | +0.313 | +11.7% | 22/23 | +0.560 | +0.019 |
+
+국면별 상관 — 상승장: A +0.357 / B +0.314 / C +0.339,
+하락장: A +0.297 / B +0.377 / C +0.416.
+
+종목별 관측 최대낙폭: DIV -54%, VNQ -43%, SPHD -42% ↔ 446720·458730·402970 -14%.
+
+**기간 안정성 검증 실패.** 세 방식 모두 2022년 이후 상관이 0 부근으로 무너진다.
+전체 +0.31 은 사실상 2021년 이전(2020 코로나 급락과 V자 회복)이 만든 값이다.
+부호는 두 기간 모두 양(+)으로 유지돼 방향이 반대였던 기울기와는 다르지만,
+**강도를 신뢰할 수 없다.**
+
+세 방식의 우열은 가릴 수 없다(0.306~0.319, 노이즈 범위). 성능이 같으므로
+선택은 원칙 문제가 된다 — A 는 하드코딩된 절대 기준이라 종목별로 불공평하다
+(같은 -10% 가 DIV 에겐 일상, 국내 신규 상장에겐 역대급).
+
+**단, B·C 에는 새 위험이 있다.** 최소 낙폭 3종이 모두 국내 2022~23년 상장으로,
+-14% 는 저변동이 아니라 **아직 위기를 겪지 않았다**는 뜻이다. B 는 그 -14% 를
+만점 기준으로 삼아 평범한 조정에 만점을 준다. 현재 최소 이력 요건 1년
+(`MIN_DD_HISTORY=252`)은 부족하며, 3년 이상으로 올리거나 이력이 짧으면
+중립 처리해야 한다.
+
+### 4-5. 환율 밴드 (원화 환산 수익)
+
+앞선 검증은 forward 수익을 달러 기준으로 재서 환율 항목이 **평가에서 아예
+빠져 있었다**(영향을 줄 수 없는 결과로 평가). 원화 환산으로 다시 쟀다.
+
+| 밴드 | 상관 | 표본 |
+|---|---|---|
+| 3년 | +0.440 | 월말 22개 (2023-11~2025-08) |
+| 5년 | +0.249 | 월말 3~4개 (n64) |
+
+**둘 다 검증 불가로 판단한다.** 5년 밴드는 fx 이력이 2021-08 부터라 5년이 쌓인
+시점이 방금 왔고, 거기서 12개월 앞을 보려면 미래가 필요하다. 3년 밴드 +0.440 도
+실질 독립 관측이 두어 개이며, 해당 기간 원화가 일관되게 약세여서 예측이라기보다
+**추세를 되읽은 값**에 가깝다. 원화가 강세로 돌면 부호가 뒤집힌다.
+환율 신호는 같은 날 전 종목이 동일하므로 종목 수(n503)는 표본을 늘려주지 않는다.
+
+### 4-6. 낙폭 혼합안 + 기울기 기간 분할 (관측 1,661 / 29종)
+
+A(절대)와 C(자기 이력 백분위)를 혼합해 서로의 실패 모드를 막는 안을 검증했다.
+전제인 **A↔C 상관은 +0.898** — 0.95 미만이라 혼합이 무의미하진 않으나
+대부분 같은 신호다.
+
+| 방식 | 전체 | 동일종목차 | 양(+) | ~2021 | 2022~ |
+|---|---|---|---|---|---|
+| A 절대 | +0.319 | +13.2% | 23/23 | +0.566 | +0.022 |
+| C 백분위 | +0.313 | +11.7% | 22/23 | +0.560 | +0.019 |
+| D 평균 | +0.325 | +12.5% | 23/23 | +0.573 | +0.021 |
+| **D 최소** | **+0.342** | +12.7% | 22/23 | +0.578 | **+0.035** |
+
+D최소가 가장 높으나 개선폭(+0.319→+0.342)은 노이즈 범위이며,
+**2022년 이후 붕괴는 해소되지 않았다**(0.02~0.04). 예상대로 혼합은
+예측력을 살리지 못했다.
+
+**4-4 에서 제기한 C 의 약점은 실측에서 확인되지 않았고, 오히려 A 가
+더 나쁜 문제를 갖고 있었다.** 이력 짧은 관측에서 만점(0.95+) 비율은
+**A 33% / C 10% / D최소 10%** 다. A 는 하드코딩된 -10% 상한 때문에
+-10% 든 -30% 든 전부 1.0 으로 뭉개, 세 관측 중 하나꼴로 변별력을 잃는다.
+
+**단, 이력 길이 분리 자체에 결함이 있다.** `hist_years` 를 as_of 시점 기준으로
+쟀는데 가격 데이터가 전 종목 2014년부터라, 미국 종목의 2017~2019 관측이
+모두 '단기' 로 분류된다. 단기/장기가 시기와 교란돼 있어 단기 상관이 높은 것
+(+0.42 vs +0.16)은 이력 길이가 아니라 **초기 기간 효과**일 수 있다.
+만점 비율 비교는 유효하나 상관 비교는 그대로 읽으면 안 된다.
+
+**200일선 기울기 기간 분할**
+
+| 항목 | 전체 | 동일종목차 | 양(+) | ~2021 | 2022~ |
+|---|---|---|---|---|---|
+| 기울기 | -0.257 | -11.8% | **0/23** | -0.409 | +0.030 |
+
+국면별 — 상승장 -0.285 / 하락장 -0.251.
+
+23종 **전부** 음(-)으로, 이 연구에서 가장 일관된 항목이다. 기간을 나누면
+초기 강한 음(-0.409), 최근 사실상 0(+0.030). **어느 기간에서도 양(+)의
+예측력을 보인 적이 없어 8점 배점의 근거가 없다 → 제거 정당.**
+동시에 최근 기간이 0 이므로 **뒤집어 가점을 주는 것도 부당하다.**
+"제거는 중립, 뒤집기는 베팅" 이라는 원칙이 데이터로도 확인됐다.
+
+**종합 관찰.** 낙폭과 기울기 모두 신호가 2021년 이전에만 있고 이후 사라진다.
+둘은 사실 같은 현상('많이 빠진 것')의 양면이며, 2020년 급락과 V자 회복이
+그 신호를 통째로 만들었다. **가격 기반 타점 신호는 사실상 사건 하나에서
+나온다** — 타점 비중 축소의 가장 강한 근거다.
+
+## 5. 판정
+
+**타점 점수는 이후 수익을 예측하지 못한다.** 횡단면에서 보이던 약한 양(+)
+기울기는 종목을 고정하면 사라지거나 음(-)으로 뒤집힌다. 즉 "점수 높은 종목이
+더 좋았다" 는 신호였지 "지금이 살 때다" 를 맞힌 것이 아니다. 종합 점수의 더 큰
+기울기(+8.8%)는 품질 축이 과거 성과로 만들어진 데서 오는 **순환 논리**로
+설명될 수 있어, 예측력의 증거로 삼을 수 없다.
+
+**실패 메커니즘.** 국면 down 에서 타점 상위절반(+9.8%)이 하위절반(+12.8%)보다
+낮다. 200일선 기울기 8점은 하락 추세 종목을 거르려고 넣은 장치인데,
+2020·2022 급락 뒤 V자 반등 구간에서 **가장 좋은 매수 기회에 감점**을 줬다.
+고점 낙폭 6점의 가점보다 기울기 8점의 감점이 커서 방향이 뒤집혔다.
+
+**부수 확인.** 프로덕션의 200일선 기울기는 저장 `ma200` 이 하루치뿐이라 계속
+중립으로 죽어 있었다(6절 결함 1). 백테스트는 이를 **살려서** 계산했음에도
+예측력이 없었다. 즉 그 버그를 고쳐도 타점 정확도는 나아지지 않는다.
+버그 수정과 로직 유효성은 별개 문제였다.
+
+**분해가 밝힌 상쇄 구조.** 가격위치 20점은 성격이 반대인 신호를 한 점수에
+합쳐 놓았고, **부호가 틀린 항목에 더 큰 가중치**가 걸려 있다.
+
+```
+  기울기 8점  방향 반대 (-0.238)  ─┐
+  낙폭   6점  방향 맞음 (+0.310)  ─┼→  합계 -0.051 (상쇄 후 약간 뒤집힘)
+  20일   6점  거의 무 (-0.008)   ─┘
+```
+
+각 항목은 따로 보면 ±13% 씩 힘이 있는데, 합쳐 놓으니 서로를 지웠다.
+합계 점수가 "예측력 없음" 으로 보인 것은 신호가 없어서가 아니라
+**신호를 반대로 겹쳐 놓았기 때문**이다.
+
+**단, 부호를 뒤집는 것으로 결론내지 않는다.** 29종이 모두 같은 시장의 같은
+급락(2018 말·2020-03·2022)을 공유하므로 "28/29종 일관" 은 독립 관측 28건이
+아니라 실질적으로 **급락 사건 3~4건**에 대한 관측이다. 그 3~4건이 전부 빠르게
+회복한 시대였다. 종목 수가 근거를 실제보다 강해 보이게 만든다.
+
+## 6. 발견한 결함
+
+1. **저장 `ma200` 이 마지막 날짜 1행뿐** — `store.py` 는 매일 저장하도록 고쳐져
+   있으나 실제 DB 에는 반영되지 않았다. `recompute()` 는 60일 전 `ma200` 을
+   빼서 기울기를 내므로 **타점 20점 중 추세 8점이 상시 중립**이었고 신뢰도도
+   그만큼 깎이고 있었다. → `engine/asof.py` 가 종가에서 재계산하도록 하여 해소
+   (배포 시 적용).
+2. **`etf_price_daily` 에 `open`·`low` 컬럼 없음** — 레포의 `store.py` 는 두 컬럼을
+   INSERT 하므로, **v13 수집기는 이 DB 에서 정상 실행된 적이 없다.** 배당락 낙폭
+   지표도 전 구간 산출 불가. 마이그레이션 + 재수집 필요.
+3. **배당 이력이 2020-08 이후뿐** — 기성 ETF(SPY·VYM·SDY)조차 그렇다. 과거
+   시점에서 3·5년 CAGR 이 성립하지 않아 품질 축은 과거 검증이 불가능하다.
+4. **국내 종목 `rows_1y` 가 294** — 연간 거래일(약 246)을 초과해 중복 적재가
+   의심된다. 미조사, 이번 범위 밖.
+5. (작업 과정) 초기 데이터 진단 쿼리에서 두 테이블을 한 번에 LEFT JOIN 해
+   카티션 곱이 발생, 행수가 부풀려졌다. 테이블별 사전 집계로 정정.
+6. **`bt_report.quintile_table` 의 구간 표시가 원신호에서 무의미** — 값이
+   소수(-0.08 등)인데 `:.0f` 로 반올림해 `-0~-0` 으로 찍힌다. 집계 숫자 자체는
+   정상이며 라벨만 읽을 수 없다. 표시 전용 결함.
+
+## 7. 한계 — 이 결과로 단정하지 않는 것
+
+- **표본 중첩.** 월별 관측에 12개월 창을 쓰므로 창이 겹친다. 유효 독립표본은
+  표시된 n 보다 훨씬 적어 통계적 유의성은 주장하지 않는다. 방향과 단조성만 읽었다.
+- **기간 편향.** 2017~2026 은 대형주 강세와 급락 후 빠른 V자 반등이 반복된
+  특이 구간이다. "추세 추종형 감점" 이 불리했던 것은 이 시기 특성일 수 있다.
+- **국내 종목 기여 거의 없음.** 일봉이 2022~2023 부터라 사실상 미국 종목이
+  결론을 끌었다.
+- 따라서 결론은 "이 점수 체계가 **이 기간에** 작동하지 않았다" 이며,
+  "타이밍 판단 자체가 불가능하다" 는 아니다.
+
+## 8. 결론적 권고
+
+기간 분할 결과(4-4)를 반영해 **"타점 공식을 개선한다" 에서 "타점의 비중을
+낮춘다" 로 방향을 바꾼다.** 낙폭 신호조차 한 시대에만 강했으므로, 어떤 공식을
+쓰든 큰 가중치를 지탱하지 못한다.
+
+| 항목 | 현행 | 권고 | 근거 |
+|---|---|---|---|
+| 200일선 기울기 | 8점 | **점수 제거, 경고 유지** | 23/23종 음(-). 두 기간 모두 양(+)인 적 없음(4-6). 뒤집지 않는 이유는 최근 기간이 0 이고, 구조적 하락 종목에 최고점을 주게 되기 때문 |
+| 고점 낙폭 | 6점 | **D최소 = min(절대, 자기이력백분위)** | 유일하게 방향 일관. 혼합은 성능이 아니라 A 의 포화(만점 33%) 회피가 이유. 2022~ 강도 붕괴로 증량 불가 |
+| 20일 변동 | 6점 | **제거** | U자 비단조, 선형 배점 부적합 |
+| 환율 | 10점 | 현행(3년) 유지 | 5년 변경은 지지·반박 근거 모두 없음 |
+| 품질:타점 | 60:40 | **타점 비중 축소** | 타점 두 축이 검증 실패·검증 불가. 가격 신호는 사실상 2020년 사건 하나에서 나옴 |
+
+## 9. 남은 일
+
+- 위 권고에 따른 `score.py` 반영 및 재검증
+- 자기 기준 정규화 채택 시 최소 이력 요건 상향 검토
+  (`MIN_DD_HISTORY` 1년 → 3년. 4-6 에서 C 의 과대평가는 관측되지 않았으나
+  D최소는 A 의 하드코딩 상한을 여전히 안고 있다)
+- 이력 길이 교란 없는 재검증 — 종목별 상장일 기준으로 분리 (4-6 결함)
+- `open`·`low` 컬럼 마이그레이션 + 재수집 (결함 2)
+- `quintile_table` 구간 표시 포맷 수정 (결함 6)
+- `api/main.py` recompute 전환분 배포 (점수가 바뀌므로 별도 판단 필요)
+- 국내 종목 중복 적재 조사 (결함 4)
