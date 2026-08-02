@@ -1,98 +1,193 @@
-"""스키마 마이그레이션.
+const BASE = import.meta.env.VITE_API_BASE || '/api'   // Vercel 프록시 경유(HTTPS)
 
-왜 필요한가: `schema.sql` 은 `CREATE TABLE IF NOT EXISTS` 라서, 이미 있는 테이블에
-컬럼을 추가하지 못한다. 그래서 기능을 추가할 때마다 사람이 `ALTER TABLE` 을
-따로 실행해야 했고, 그걸 잊으면 서버가 500 을 뱉었다. 실제로 여러 번 그랬다.
+// 환경변수에 붙여넣다 보면 줄바꿈·따옴표·공백이 딸려 온다.
+// 그대로 헤더에 넣으면 브라우저가 fetch 자체를 거부한다("Invalid value").
+const TOKEN = (import.meta.env.VITE_API_TOKEN || '')
+  .replace(/[\r\n\t]/g, '')
+  .replace(/^["']|["']$/g, '')
+  .trim()
 
-이 파일은 **서버가 켜질 때 스스로 스키마를 맞춘다.** 새 컬럼이 필요하면
-아래 MIGRATIONS 에 한 줄만 추가하면 되고, 배포할 때 사람이 할 일은 없다.
+async function req(path, options = {}) {
+  const res = await fetch(BASE + path, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(TOKEN ? { 'X-DivDesk-Token': TOKEN } : {}),
+      ...(options.headers || {}),
+    },
+  })
+  let body = null
+  try { body = await res.json() } catch { /* 본문 없는 응답 */ }
+  if (!res.ok) {
+    // 서버가 왜 거절했는지 그대로 보여준다. 삼키지 않는다.
+    const detail = body?.detail
+    const msg = res.status === 401
+      ? '접근 토큰이 맞지 않습니다. 배포 환경변수를 확인하세요.'
+      : Array.isArray(detail)
+        ? detail.map(d => d.msg).join(', ')
+        : (detail || `요청 실패 (${res.status})`)
+    throw new Error(msg)
+  }
+  return body
+}
 
-원칙:
-- 전부 `IF NOT EXISTS` 로 쓴다. 몇 번을 돌려도 안전해야 한다.
-- 컬럼 추가와 인덱스 생성만 한다. 삭제·타입 변경은 하지 않는다.
-  데이터가 사라지는 작업을 자동으로 돌리면 안 된다.
-- 실패해도 서버는 뜬다. 마이그레이션 하나 때문에 전체가 죽으면 더 나쁘다.
-"""
-from __future__ import annotations
+export const api = {
+  health: () => req('/health'),
+  etfs: (market) => req('/etfs' + (market ? `?market=${market}` : '')),
+  duplicates: () => req('/etfs/duplicates'),
+  projection: (p) => req('/projection', { method: 'POST', body: JSON.stringify(p) }),
+  syncToss: () => req('/sync/toss', { method: 'POST' }),
+  reconcile: () => req('/reconcile?account_mode=US_TAXABLE'),
+  scores: () => req('/scores'),
+  forward: (payload) => req('/calc/forward', { method: 'POST', body: JSON.stringify(payload) }),
+  reverse: (payload) => req('/calc/reverse', { method: 'POST', body: JSON.stringify(payload) }),
+  purchases: () => req('/purchases'),
+  addPurchase: (p) => req('/purchases', { method: 'POST', body: JSON.stringify(p) }),
+  delPurchase: (id) => req(`/purchases/${id}`, { method: 'DELETE' }),
+  portfolio: (mode = 'ALL') => req(`/portfolio?account_mode=${mode}`),
+  returns: (mode = 'ALL') => req(`/portfolio/returns?account_mode=${mode}`),
+  watchdog: () => req('/watchdog'),
+  calendar: (mode = 'ALL') => req(`/calendar?account_mode=${mode}`),
+  holidays: (market, year) => req(`/calendar/holidays?market=${market}&year=${year}`),
+  pushKey: () => req('/push/key'),
+  pushTest: () => req('/push/test', { method: 'POST' }),
+  alerts: () => req('/alerts'),
+  syncStatus: () => req('/sync/status'),
+}
 
-import logging
+export { won, MODES } from './format.js'
 
-log = logging.getLogger("divdesk.migrate")
-
-# 순서대로 실행된다. 새 컬럼은 맨 아래에 추가한다.
-MIGRATIONS: list[tuple[str, str]] = [
-    ("etf_master.is_benchmark",
-     "ALTER TABLE etf_master ADD COLUMN IF NOT EXISTS is_benchmark boolean DEFAULT false"),
-    ("etf_master.expense_ratio",
-     "ALTER TABLE etf_master ADD COLUMN IF NOT EXISTS expense_ratio numeric(6,4)"),
-    ("etf_price_daily.adj_close",
-     "ALTER TABLE etf_price_daily ADD COLUMN IF NOT EXISTS adj_close numeric(18,4)"),
-    ("etf_price_daily.open",
-     "ALTER TABLE etf_price_daily ADD COLUMN IF NOT EXISTS open numeric(18,4)"),
-    ("etf_price_daily.low",
-     "ALTER TABLE etf_price_daily ADD COLUMN IF NOT EXISTS low numeric(18,4)"),
-    ("purchase.is_opening_balance",
-     "ALTER TABLE purchase ADD COLUMN IF NOT EXISTS is_opening_balance boolean DEFAULT false"),
-    ("score_snapshot.facts",
-     "ALTER TABLE score_snapshot ADD COLUMN IF NOT EXISTS facts jsonb"),
-    ("sync_log",
-     """CREATE TABLE IF NOT EXISTS sync_log (
-          id bigserial PRIMARY KEY,
-          source text NOT NULL,
-          ok boolean NOT NULL,
-          added int DEFAULT 0,
-          message text,
-          ran_at timestamptz DEFAULT now()
-        )"""),
-    ("sync_log.index",
-     "CREATE INDEX IF NOT EXISTS ix_sync_recent ON sync_log(source, ran_at DESC)"),
-    ("push_subscription",
-     """CREATE TABLE IF NOT EXISTS push_subscription (
-          id bigserial PRIMARY KEY,
-          endpoint text UNIQUE NOT NULL,
-          payload jsonb NOT NULL,
-          user_agent text,
-          enabled boolean DEFAULT true,
-          created_at timestamptz DEFAULT now()
-        )"""),
-    # 컬럼을 나중에 추가하면 기존 행은 기본값으로 남는다. 마이그레이션이
-    # 컬럼은 만들어도 값은 못 채운다. 실제로 is_benchmark 가 전부 false 로
-    # 남아 벤치마크가 매수 후보 목록에 섞여 나왔다.
-    ("benchmark.backfill",
-     """UPDATE etf_master SET is_benchmark = true
-        WHERE ticker IN ('SPY','VOO','QQQ','069500') AND is_benchmark = false"""),
-    ("alert_log",
-     """CREATE TABLE IF NOT EXISTS alert_log (
-          id bigserial PRIMARY KEY,
-          ticker text,
-          kind text NOT NULL,
-          message text,
-          delivered int DEFAULT 0,
-          fired_at timestamptz DEFAULT now()
-        )"""),
-]
-
-
-def run(conn) -> dict:
-    """마이그레이션을 전부 시도하고 결과를 돌려준다.
-
-    개별 실패는 삼키고 계속 간다. 하나가 막혀서 서버가 안 뜨는 것보다,
-    뜬 다음에 그 기능만 오류를 내는 편이 고치기 쉽다.
-    """
-    applied, failed = [], []
-    for name, sql in MIGRATIONS:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-            conn.commit()
-            applied.append(name)
-        except Exception as exc:                              # noqa: BLE001
-            conn.rollback()
-            failed.append((name, f"{type(exc).__name__}: {exc}"))
-            log.warning("마이그레이션 실패 %s: %s", name, exc)
-
-    if failed:
-        log.warning("스키마 %d건 적용, %d건 실패", len(applied), len(failed))
-    else:
-        log.info("스키마 %d건 확인 완료", len(applied))
-    return {"applied": len(applied), "failed": failed}
+// ⓘ 버튼이 여는 설명. "간결하되 추가설명은 버튼으로" 요구사항의 실체.
+export const DOC = {
+  dir: ['계산 방향',
+    <>
+      <p>두 방향 모두 같은 세금 규칙을 씁니다.</p>
+      <p><b>금액 → 월배당</b>: 원금을 넣으면 세후 월평균과 월별 입금 편차를 보여줍니다.</p>
+      <p><b>월배당 → 필요금액</b>: 목표 월배당을 넣으면 필요 원금과 종목별 주수를 역산합니다.
+        주식은 정수로만 살 수 있어 내림한 뒤 부족분을 다시 채웁니다.</p>
+    </>],
+  avg: ['세후 월평균 배당은 어떻게 나오나요',
+    <>
+      <p><code>연 세전배당 ÷ 12 × (1 − 실효세율) × 환율</code></p>
+      <p>연 세전배당은 최근 지급된 분배금 합계를 보유 주수에 곱한 값입니다.
+        예상치가 아니라 이미 지급된 금액 기준입니다.</p>
+      <p>지급 횟수로 잘라서 계산합니다. 기간(예: 최근 1년)으로 자르면 지급일이 밀린 해에
+        한 번이 더 잡혀 배당률이 부풀려집니다.</p>
+    </>],
+  strip: ['월별 입금이 왜 들쭉날쭉한가요',
+    <>
+      <p>분기배당 종목은 3·6·9·12월에만 입금됩니다. 그래서 &lsquo;월평균&rsquo;과
+        &lsquo;이번 달 실제 입금&rsquo;은 다릅니다.</p>
+      <p>월배당 종목을 섞으면 평탄해집니다. 다만 월배당 상품 상당수가 커버드콜이라
+        분배금 안정성은 따로 봐야 합니다.</p>
+    </>],
+  score: ['타점 점수 계산식',
+    <>
+      <p>두 축입니다. <b>품질은 이 상품이 꾸준한가, 타점은 지금 얼마나 싸게 사는가.</b></p>
+      <p><code>배당률 30 · 가격 위치 20 · 분배금 성장 15 · 위험조정 수익 15 · 환율 10 · 배당락 회복력 10</code></p>
+      <p>종합은 <b>품질 75% + 타점 25%</b>. 85 이상 적극매수, 70~84 매수, 55~69 분할·관망,
+        55 미만 보류. 품질이 50점 미만이면 아무리 싸도 제외합니다.</p>
+      <p><b>타점 비중이 낮은 이유</b> — 과거 10년으로 검증해 보니 가격으로 매수 시점을 맞히는
+        힘이 거의 없었습니다. 방향이 맞은 건 고점 대비 낙폭 하나뿐이라, 200일선 추세와
+        골든크로스는 점수에서 빼고 경고로만 남겼습니다.</p>
+      <p><b>가격 위치</b>는 고점 대비 낙폭을 그 종목 자기 이력과 함께 봅니다. 같은 -10%도
+        평소 -50%씩 빠지던 종목엔 평범하고, -14%가 최대였던 종목엔 역대급이기 때문입니다.</p>
+      <p>배당률이 높다고 점수가 오르지 않습니다. <b>그 종목의 과거 자기 배당률 대비 지금이 싼지</b>를 봅니다.
+        커버드콜은 분배금 일부가 옵션 프리미엄·원금환급이라 총수익 항목에서 감점될 수 있습니다.</p>
+    </>],
+  tax: ['계좌모드에 따라 세금이 왜 달라지나요',
+    <>
+      <p><b>일반·미국상장</b>: 현지에서 15% 원천징수. 한국 배당소득세율(14%)보다 높아
+        통상 추가 납부가 없습니다. 매매차익은 별건으로 양도세 22%(연 250만원 공제, 분리과세)입니다.</p>
+      <p><b>일반·국내상장</b>: 분배금 15.4% 원천징수. 국내상장 해외ETF는 매매차익도
+        배당소득으로 과세되고 금융소득 한도에 합산됩니다.</p>
+      <p><b>절세계좌</b>: 분배금이 즉시 과세되지 않고 이연됩니다. 다만 국내상장 ETF만 담을 수 있습니다.</p>
+      <p>세율은 앱에 박혀 있지 않고 서버 설정값에서 읽습니다. 세법이 바뀌면 그 값만 갱신됩니다.</p>
+    </>],
+  watchdog: ['금융소득 워치독',
+    <>
+      <p>연간 금융소득(이자+배당)이 2,000만원을 넘으면 초과분이 다른 소득과 합산돼
+        누진세율(6.6~49.5%)이 적용됩니다.</p>
+      <p>기준의 80%에 닿으면 미리 알려드립니다. 이때부터는 절세계좌 활용을 검토할 시점입니다.</p>
+      <p>여기 집계되는 값은 이 앱에 기록된 배당만입니다. 예금 이자 등 다른 금융소득은 포함되지 않습니다.</p>
+    </>],
+  total: ['총수익은 어떻게 계산하나요',
+    <>
+      <p><code>총수익 = 배당 + 시세차익 + 환차익</code></p>
+      <p><b>시세차익</b>은 주가가 오른 몫, <b>환차익</b>은 환율이 움직인 몫입니다.
+        원화 투자자에게는 이 둘을 나눠 봐야 합니다 — 주가가 그대로여도
+        1,300원에 사서 1,430원이면 원화로는 이익이고, 반대면 손실입니다.</p>
+      <p>나눠 산 경우 <b>매수건마다 그때의 환율</b>을 각각 적용합니다.
+        평균 환율을 쓰면 환차익이 틀어집니다.</p>
+      <p>시세차익·환차익은 아직 팔지 않은 평가손익이라 세금이 붙지 않았습니다.
+        "지금 전부 팔면" 예상 세금은 따로 표시합니다.</p>
+    </>],
+  proj: ['적립 시뮬레이션은 어떻게 계산하나요',
+    <>
+      <p>과거 실제 시세 위에서 <b>시작 시점을 한 달씩 옮겨가며 전부 돌린 결과</b>입니다.
+        평균 수익률로 복리를 굴려 하나의 숫자를 내는 방식은 쓰지 않습니다 —
+        언제 시작했느냐로 결과가 크게 갈리기 때문입니다.</p>
+      <p>그래서 <b>중간값·최악·최선</b>을 함께 보여줍니다. 중간값이 가장 그럴듯한 값이고,
+        최악은 가장 나쁜 시점에 시작했을 때입니다.</p>
+      <p>수정종가를 쓰므로 <b>배당 재투자와 복리가 이미 반영</b>돼 있습니다.
+        배당을 따로 더할 필요가 없습니다.</p>
+      <p>기간은 <b>연·개월로 원하는 만큼</b> 지정합니다. 3년 6개월처럼 잡아도 됩니다.
+        기간이 길수록 시험할 수 있는 시작 시점이 줄어들어 결과가 몇몇 시기에
+        좌우됩니다 — 그럴 때는 아래에 그 사실을 함께 적어 둡니다.</p>
+      <p><b>달러 기준</b>으로 계산합니다. 먼 미래의 환율은 알 수 없고, 과거 환율로 굴리면
+        환율 추세가 섞여 종목 비교가 흐려집니다. 원화는 현재 환율을 곱한 참고값입니다.</p>
+      <p>상장일이 다른 종목은 <b>공통 구간</b>에 맞춰 계산합니다. 오래된 종목만
+        과거 폭락장을 겪은 것으로 나오면 비교가 왜곡되기 때문입니다.</p>
+      <p>이력이 짧아 요청한 기간을 못 채우는 종목은 <b>계산에서 빼고 따로 알립니다.</b>
+        억지로 짧은 구간에 맞춰 넣으면 다른 종목과 같은 조건이 아니게 됩니다.</p>
+    </>],
+  dup: ['같은 지수를 추종하는 종목',
+    <>
+      <p>같은 지수를 따라가는 ETF를 여러 개 담아도 분산 효과가 없습니다. 내용물이 같으니까요.</p>
+      <p>고르는 기준은 배당률이 아니라 <b>총보수와 순자산</b>입니다. 배당률 차이는
+        조회 시점의 주가 차이일 뿐이고, 보수는 매년 확정적으로 나갑니다.</p>
+      <p>보수 차이가 0.02%p 이내면 사실상 같다고 봅니다. 1억원에 연 2만원 차이인데,
+        그것 때문에 순자산이 훨씬 작은 종목을 고르면 매매할 때 호가 손실이 더 큽니다.</p>
+    </>],
+  recon: ['잔고 대조',
+    <>
+      <p>이 앱에 쌓인 매수기록의 합계와 증권사의 실제 보유수량을 맞춰봅니다.</p>
+      <p><b>지금은 매도를 반영하지 않습니다.</b> 팔았는데 기록에 남아 있으면
+        보유수량과 수익이 실제보다 크게 나오므로, 차이를 여기서 잡아냅니다.</p>
+      <p>액면분할이나 무상증자처럼 주문 없이 수량이 바뀌는 경우도 여기 걸립니다.</p>
+    </>],
+  cal: ['배당예상일지는 어떻게 만드나요',
+    <>
+      <p>보유 종목의 과거 배당 이력에서 지급 간격을 뽑아 앞으로 12개월 일정을 만듭니다.</p>
+      <p>지급일은 배당락일에서 시장 규칙으로 계산합니다. 미국은 배당락 4영업일 뒤,
+        국내는 지급기준일 다음 달 초가 기준입니다.</p>
+      <p>휴장일은 <b>수집된 시세에서 도출</b>합니다. 거래가 있었던 날이 거래일이고
+        평일 중 빠진 날이 휴장일이라, 공휴일 표를 따로 관리하지 않아도 저절로 맞습니다.</p>
+      <p><b>확정</b> 표시는 운용사가 공시한 배당이고, 나머지는 추정치입니다.
+        추정 금액은 최근 4회 평균에 추세를 절반만 반영합니다 —
+        커버드콜은 변동이 커서 추세를 그대로 밀면 과하게 나옵니다.</p>
+    </>],
+  ret: ['총수익률은 어떻게 계산하나요',
+    <>
+      <p>수정종가(분배금을 재투자한 것으로 보정한 가격)의 1년 전 대비 비율입니다.</p>
+      <p>가격 변동에 분배금을 단순히 더하는 방식은 재투자 효과를 빼먹은 근사치라
+        쓰지 않습니다. 수정종가가 없는 종목에서만 그 방식으로 물러섭니다.</p>
+      <p>이 값이 분배율보다 낮으면 분배금이 원금을 깎고 있다는 신호입니다.</p>
+    </>],
+  push: ['매수 추천 알림',
+    <>
+      <p>점수가 85점 이상으로 <b>올라선 날에만</b> 보냅니다.
+        매일 85점이라고 매일 보내면 알림이 소음이 되기 때문입니다.</p>
+      <p>같은 종목은 14일 안에 다시 보내지 않습니다.</p>
+      <p>아이폰은 <b>홈 화면에 추가한 상태</b>에서만 알림을 받을 수 있습니다.
+        사파리 공유 → 홈 화면에 추가를 먼저 해주세요.</p>
+    </>],
+  cc: ['분배금 ≠ 수익',
+    <>
+      <p>커버드콜 ETF는 옵션을 팔아 받은 프리미엄을 분배금으로 나눠줍니다.
+        여기에 원금 일부를 돌려주는 몫(ROC)이 섞이기도 합니다.</p>
+      <p>그래서 분배율이 10%를 넘어도 <b>총수익(가격 변동 + 분배금)</b>은 낮거나 마이너스일 수 있습니다.
+        기초자산이 오를 때 그 상승을 다 못 따라가는 구조이기 때문입니다.</p>
+      <p>분배율만 보고 판단하지 마시고 총수익 항목을 함께 보세요.</p>
+    </>],
+}
