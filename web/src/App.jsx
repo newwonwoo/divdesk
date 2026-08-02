@@ -475,7 +475,7 @@ function Screener({ onDoc }) {
                     <b>{timing}</b>
                   </div>
                   <div className="axis-note">
-                    품질 60% + 타점 40%
+                    품질 75% + 타점 25%
                     {confidence != null && confidence < 80 && (
                       <span className="low-conf"> · 데이터 신뢰도 {confidence}%</span>
                     )}

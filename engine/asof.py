@@ -25,8 +25,12 @@ store.py / recompute() 의 창 정의를 그대로 미러링한다:
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+
+WIN52 = 252                  # 52주 창(거래일)
+MIN_DD_HISTORY = 252         # 낙폭 백분위를 내려면 최소 이 만큼의 낙폭 이력이 필요
 
 from .dividend import compute as compute_dividend
 from .dividend import describe as describe_dividend
@@ -85,6 +89,42 @@ def _ma_at(ts: TickerSeries, upto_idx: int, window: int = 200) -> float | None:
     if upto_idx < window:
         return None
     return _mean(ts.close[upto_idx - window:upto_idx])
+
+
+def _dd_history(close: list, upto: int) -> list:
+    """0..upto-1 구간의 일자별 52주 고점 대비 낙폭. 미성립 구간은 뺀다.
+
+    dd[k] = close[k] / max(close[k-251:k+1]) - 1   (0 이하)
+    단조 덱으로 슬라이딩 최대값을 O(n) 에 낸다. upto 를 넘겨 보지 않으므로
+    as_of 이후 데이터가 섞이지 않는다(look-ahead 차단).
+    """
+    out: list = []
+    dq: deque = deque()                      # 값 내림차순 인덱스
+    for k in range(upto):
+        v = close[k]
+        while dq and close[dq[-1]] <= v:
+            dq.pop()
+        dq.append(k)
+        while dq[0] <= k - WIN52:
+            dq.popleft()
+        if k >= WIN52 - 1:
+            hi = close[dq[0]]
+            if hi > 0:
+                out.append(v / hi - 1)
+    return out
+
+
+def _dd_pctile(close: list, upto: int) -> float | None:
+    """지금 낙폭이 과거 낙폭 분포에서 어느 위치인가. 1.0 이면 역대 최악.
+
+    이력이 짧으면 None — 아직 위기를 겪지 않은 종목이 평범한 조정에 만점을
+    받는 것을 막는다. 그 경우 score() 가 절대 기준만으로 물러선다.
+    """
+    hist = _dd_history(close, upto)
+    if len(hist) < MIN_DD_HISTORY:
+        return None
+    cur = hist[-1]
+    return sum(1 for d in hist if d > cur) / len(hist)
 
 
 def _risk_prices(ts: TickerSeries, as_of: date, i: int, years: int = 3) -> list:
@@ -170,9 +210,12 @@ def build_input(panel: Panel, ticker: str, as_of: date) -> ScoreInput | None:
     if ma_now and ma_past and ma_past > 0:
         ma200_slope = round((ma_now - ma_past) / ma_past, 4)
 
-    high52 = max(ts.close[i - 252:i]) if i >= 252 else None
-    low52 = min(ts.close[i - 252:i]) if i >= 252 else None
+    high52 = max(ts.close[i - WIN52:i]) if i >= WIN52 else None
+    low52 = min(ts.close[i - WIN52:i]) if i >= WIN52 else None
     drawdown = round(price / high52 - 1, 4) if high52 and high52 > 0 else None
+    # 절대 낙폭만으로는 종목별 변동성 차이를 보정하지 못한다. 자기 이력에서의
+    # 위치를 함께 넘겨 score() 가 둘 중 낮은 쪽을 쓰게 한다.
+    dd_pctile = _dd_pctile(ts.close, i) if drawdown is not None else None
 
     change_20d = None
     if i >= 21 and ts.close[i - 21] > 0:
@@ -225,7 +268,7 @@ def build_input(panel: Panel, ticker: str, as_of: date) -> ScoreInput | None:
         risk_label=risk_label, risk_sub=risk_sub,
         fx_exposed=(bench != "069500"),
         fx_hedged=bool(meta.get("fx_hedged")),
-        ma200_slope=ma200_slope, drawdown=drawdown,
+        ma200_slope=ma200_slope, drawdown=drawdown, dd_pctile=dd_pctile,
         days_to_ex=None,
         exdrop_ratio=drop.drop_ratio, exdrop_samples=drop.samples,
         exdrop_recovery=drop.open_recovery, exdrop_unrecovered=drop.unrecovered,

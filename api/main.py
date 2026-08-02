@@ -19,13 +19,10 @@ from pydantic import BaseModel, Field
 
 from collector.store import Store
 from engine.calc import ALLOC_EQUAL, Holding, forward, reverse
-from engine.calendar import (TradingCalendar, monthly_ledger, next_ex_date,
+from engine.calendar import (TradingCalendar, monthly_ledger,
                              predict_schedule)
-from engine.score import ScoreInput, score
-from engine.dividend import compute as compute_dividend
-from engine.dividend import describe as describe_dividend
+from engine.asof import panel_from_rows, score_asof
 from engine.risk import compute as compute_risk
-from engine.risk import describe as describe_risk
 from engine.exdrop import (RECOVERY_LIMIT, ExDropSample, ExDropStat,
                            compute_sample, summarize)
 from engine.projection import common_start
@@ -555,133 +552,58 @@ def scores(limit: int = 40):
                              ORDER BY s.ticker, s.date DESC LIMIT %s""", (limit,))}
 
 
+def load_panel():
+    """DB 전체 시계열을 한 번에 읽어 engine.asof.Panel 로 조립한다.
+
+    채점 조립을 engine.asof 한 곳으로 모으기 위한 어댑터다. 지표(ma200 등)는
+    저장 컬럼을 읽지 않고 asof 가 종가에서 그 시점 창으로 다시 계산한다 —
+    저장 ma200 이 마지막 날짜치만 있어 기울기가 죽던 문제를 여기서 해소한다.
+    open/low 컬럼이 아직 없는 배포 상태도 견디도록 존재 여부를 확인해 NULL 로 채운다.
+    """
+    meta_rows = [{
+        "ticker": m["ticker"], "market": m["market"],
+        "is_benchmark": m["is_benchmark"], "is_covered_call": m["is_covered_call"],
+        "pays_per_year": m["pays_per_year"],
+        "index": (m["tags"] or {}).get("index") if isinstance(m["tags"], dict) else None,
+        "fx_hedged": bool((m["tags"] or {}).get("fx_hedged")) if isinstance(m["tags"], dict) else False,
+    } for m in rows("SELECT ticker,market,is_benchmark,is_covered_call,"
+                    "pays_per_year,tags FROM etf_master")]
+
+    have = {c["column_name"] for c in rows(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_name='etf_price_daily'")}
+    oc = "open" if "open" in have else "NULL AS open"
+    lc = "low" if "low" in have else "NULL AS low"
+    price_rows = [(r["ticker"], r["date"], r["close"], r["adj_close"],
+                   r["open"], r["low"]) for r in rows(
+        f"SELECT ticker,date,close,adj_close,{oc},{lc} "
+        "FROM etf_price_daily ORDER BY ticker,date")]
+
+    div_rows = [(r["ticker"], r["ex_date"], r["dps"]) for r in rows(
+        "SELECT ticker,ex_date,dps FROM dividend_history "
+        "WHERE is_estimate=false ORDER BY ticker,ex_date")]
+    fx_rows = [(r["date"], r["usdkrw"]) for r in rows(
+        "SELECT date,usdkrw FROM fx_rate ORDER BY date")]
+    return panel_from_rows(meta_rows, price_rows, div_rows, fx_rows)
+
+
 @app.post("/scores/recompute")
 def recompute():
-    """저장된 데이터로 스코어를 다시 계산해 오늘 날짜로 적재한다."""
-    fx, _ = latest_fx()
-    fx_hist = [float(r["usdkrw"]) for r in
-               rows("SELECT usdkrw FROM fx_rate ORDER BY date DESC LIMIT 780")]
+    """저장된 데이터로 스코어를 다시 계산해 오늘 날짜로 적재한다.
+
+    채점은 engine.asof(백테스트와 동일 경로)로 낸다. 지표는 종가에서 그 시점
+    창으로 다시 계산하므로, 저장 ma200 이 하루치뿐이라 200일선 기울기가 죽던
+    문제가 함께 해소된다.
+    """
+    panel = load_panel()
+    today = date.today()
     made, skipped = 0, []
-    estimate_notes: list[str] = []
-    _RISK_CACHE.clear()
     conn = db()
-    for meta in rows("SELECT * FROM etf_master"):
-        ticker = meta["ticker"]
-        pays = int(meta["pays_per_year"] or 4)
-        px = rows("""SELECT close,ma200,high52,low52 FROM etf_price_daily
-                     WHERE ticker=%s ORDER BY date DESC LIMIT 1""", (ticker,))
-        # 분배금 성장은 장기로 봐야 한다. 5년 CAGR 을 내려면 6년치가 필요하다.
-        dv = rows("""SELECT ex_date,dps FROM dividend_history
-                     WHERE ticker=%s AND is_estimate=false
-                     ORDER BY ex_date DESC LIMIT %s""", (ticker, pays * 8))
-        if not px or len(dv) < pays:
+    for ticker in list(panel.meta):
+        result = score_asof(panel, ticker, today)
+        if result is None:
             skipped.append(ticker)
             continue
-        amounts = [float(d["dps"]) for d in dv]
-        ttm = sum(amounts[:pays])
-        prev = sum(amounts[pays:pays * 2]) if len(amounts) >= pays * 2 else None
-        price = float(px[0]["close"])
-        yield_hist = [sum(amounts[i:i + pays]) / price * 100
-                      for i in range(0, max(0, len(amounts) - pays))]
-        # 1년 총수익률. 수정종가(분배금 재투자 반영)의 비율이 정확한 총수익이다.
-        # 수정종가가 없을 때만 근사식으로 물러선다.
-        year_ago = rows("""SELECT close, adj_close FROM etf_price_daily
-                           WHERE ticker=%s AND date <= CURRENT_DATE - INTERVAL '1 year'
-                           ORDER BY date DESC LIMIT 1""", (ticker,))
-        now_adj = rows("""SELECT adj_close FROM etf_price_daily
-                          WHERE ticker=%s AND adj_close IS NOT NULL
-                          ORDER BY date DESC LIMIT 1""", (ticker,))
-        total_ret = None
-        if year_ago:
-            base_adj = year_ago[0]["adj_close"]
-            if base_adj and now_adj and float(base_adj) > 0:
-                total_ret = round(
-                    (float(now_adj[0]["adj_close"]) / float(base_adj) - 1) * 100, 2)
-            else:
-                base = float(year_ago[0]["close"])
-                if base > 0:
-                    total_ret = round((price - base + ttm) / base * 100, 2)
-
-        # 다음 배당락일은 캘린더 엔진이 낸다. 확정 공시가 있으면 그것, 없으면
-        # 관측된 거래일 위에서 추정하고 estimated 로 표시한다.
-        cal = trading_calendar(meta["market"])
-        ex_history = [(r["ex_date"], float(r["dps"]), r.get("pay_date"))
-                      for r in reversed(dividend_rows(ticker))]
-        ex_day, days, confirmed = next_ex_date(ticker, meta["market"], ex_history, cal)
-        drop = exdrop_stat(ticker)
-
-        # 커버드콜은 기초자산 대비 얼마나 따라갔는지가 핵심이라 함께 낸다
-        bench = market_ticker(ticker)
-        bench_cagr = None
-        if bench != ticker:
-            bench_stat = risk_stat(bench)
-            bench_cagr = bench_stat.cagr if bench_stat.available else None
-        dividend = compute_dividend(amounts, pays)
-        dps_label, dps_sub = describe_dividend(dividend)
-
-        risk = risk_stat(ticker, bench_cagr)
-        if risk.available:
-            risk_label, risk_sub = describe_risk(
-                risk, ttm / price * 100 if price else None)
-        else:
-            # 위험 지표를 못 구하면 1년 총수익으로 물러선다.
-            # 이때 라벨을 "데이터 부족"으로 두면 점수와 표시가 어긋난다.
-            risk_label = (f"{total_ret:+.1f}%" if total_ret is not None else "데이터 없음")
-            risk_sub = (f"1년 총수익 (위험 지표 없음: {risk.reason})"
-                        if total_ret is not None else risk.reason)
-
-        # 최근 20거래일 변동률. 200일선·52주는 둘 다 장기라 단기 과열을 못 잡는다.
-        recent = rows("""SELECT close FROM etf_price_daily
-                         WHERE ticker=%s ORDER BY date DESC LIMIT 21""", (ticker,))
-        change_20d = None
-        if len(recent) >= 21:
-            old = float(recent[-1]["close"])
-            if old > 0:
-                change_20d = round((price - old) / old, 4)
-
-        # 200일선 기울기. 이격도만 보면 방향을 모른다 — 하락 추세 종목이
-        # "싸다" 는 이유로 만점을 받던 문제를 막는다.
-        ma_now = px[0]["ma200"]
-        ma_past = rows("""SELECT ma200 FROM etf_price_daily
-                          WHERE ticker=%s AND ma200 IS NOT NULL
-                            AND date <= CURRENT_DATE - INTERVAL '60 days'
-                          ORDER BY date DESC LIMIT 1""", (ticker,))
-        ma200_slope = None
-        if ma_now and ma_past and ma_past[0]["ma200"]:
-            base = float(ma_past[0]["ma200"])
-            if base > 0:
-                ma200_slope = round((float(ma_now) - base) / base, 4)
-
-        # 52주 고점 대비 낙폭. 조정이 곧 매수 기회다.
-        drawdown = None
-        if px[0]["high52"] and float(px[0]["high52"]) > 0:
-            drawdown = round(price / float(px[0]["high52"]) - 1, 4)
-        if ex_day and not confirmed:
-            estimate_notes.append(f"{ticker} 배당락일은 추정치")
-        result = score(ScoreInput(
-            ticker=ticker, price=price, ttm_dps=ttm, yield_history=yield_hist,
-            ma200=px[0]["ma200"] and float(px[0]["ma200"]),
-            high52=px[0]["high52"] and float(px[0]["high52"]),
-            low52=px[0]["low52"] and float(px[0]["low52"]),
-            dps_ttm_prev=prev, total_return_1y_pct=total_ret,
-            fx_history=fx_hist, fx_now=fx,
-            dps_score=dividend.score if dividend.available else None,
-            dps_label=dps_label, dps_sub=dps_sub,
-            risk_score=risk.score if risk.available else None,
-            risk_label=risk_label, risk_sub=risk_sub,
-            fx_exposed=(market_ticker(ticker) != "069500"),
-            fx_hedged=bool((meta.get("tags") or {}).get("fx_hedged")),
-            ma200_slope=ma200_slope, drawdown=drawdown,
-            days_to_ex=days, exdrop_ratio=drop.drop_ratio,
-            exdrop_samples=drop.samples,
-            exdrop_recovery=drop.open_recovery,
-            exdrop_unrecovered=drop.unrecovered,
-            exdrop_gap=drop.intraday_gap, change_20d=change_20d,
-            is_covered_call=bool(meta["is_covered_call"]),
-            is_krw_listed=meta["market"] == "KR",
-            # 상장 시장이 아니라 기초자산 국적으로 판단한다.
-            # market_ticker() 가 이미 그 판별을 하고 있으므로 재사용한다.
-            ))
         note = result.reason + (" ⚠ " + " / ".join(result.warnings) if result.warnings else "")
         with conn.cursor() as cur:
             cur.execute("""INSERT INTO score_snapshot
@@ -704,7 +626,6 @@ def recompute():
         made += 1
     conn.commit()
     return {"computed": made, "skipped": skipped,
-            "estimated_ex_dates": len(estimate_notes),
             "at": datetime.now().isoformat(timespec="seconds")}
 
 

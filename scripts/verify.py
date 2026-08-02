@@ -428,7 +428,7 @@ eq("데이터 없으면 신뢰도 0", sc(ScoreInput('N', 100.0, 4.0)).confidence
 eq("신뢰도 낮으면 경고에 명시",
    any('신뢰도' in w for w in sc(ScoreInput('N', 100.0, 4.0)).warnings), True)
 eq("타점 0~100", 0 <= r2.timing <= 100, True)
-eq("종합은 품질6:타점4", r2.total, round(r2.quality * 0.6 + r2.timing * 0.4))
+eq("종합은 품질75:타점25", r2.total, round(r2.quality * 0.75 + r2.timing * 0.25))
 
 # 품질이 낮으면 타점이 좋아도 제외한다. 나쁜 상품을 싸다고 사면 안 된다.
 bad = dict(two, risk_score=0.5, dps_score=1.0, exdrop_ratio=1.8)
@@ -447,21 +447,49 @@ drop = sc(ScoreInput(ticker='D', price=100.0, ttm_dps=5.0, yield_history=hist,
 eq("배당 성장은 품질로", grow.quality > drop.quality, True)
 eq("주가 하락은 타점으로", drop.timing > grow.timing, True)
 
-# --- 가격 위치: 추세 중심 ---
-# "높으면 감점" 은 오르는 종목을 계속 깎고 하락 추세에 가점을 주는 구조였다.
+# --- 가격 위치: '얼마나 싸게 사는가' 하나만 ---
+# 백테스트(2017~2026)에서 세 요소의 방향이 갈렸다. 기울기는 23/23 종목에서
+# 음(-), 20일 과열은 U자 비단조, 낙폭만 방향이 일관됐다(28/29).
+# 기울기·20일을 점수에서 빼고 경고로만 남긴다. 골든크로스도 검증 후 제외했다.
 def price_pt2(**kw):
     r = sc(ScoreInput(ticker='P', price=100.0, ttm_dps=4.0, **kw))
     return [f for f in r.facts if f[0] == '가격 위치'][0][3]
 
-up_dip = price_pt2(ma200_slope=0.03, drawdown=-0.08, change_20d=-0.02)
-up_high = price_pt2(ma200_slope=0.03, drawdown=0.0, change_20d=0.02)
-down = price_pt2(ma200_slope=-0.04, drawdown=-0.15, change_20d=-0.05)
-spike = price_pt2(ma200_slope=0.02, drawdown=0.0, change_20d=0.15)
-eq("상승추세+조정이 최고점", up_dip > up_high > down, True)
-eq("하락추세는 많이 빠져도 낮음", down < up_high, True)
-eq("단기 급등은 감점", spike < up_high, True)
-eq("하락추세 경고", any('하락 추세' in w for w in
+eq("낙폭 클수록 고득점",
+   price_pt2(drawdown=-0.12) > price_pt2(drawdown=-0.05) > price_pt2(drawdown=0.0), True)
+eq("기울기는 점수에 영향 없음",
+   price_pt2(drawdown=-0.05, ma200_slope=0.03)
+   == price_pt2(drawdown=-0.05, ma200_slope=-0.04), True)
+eq("20일 변동은 점수에 영향 없음",
+   price_pt2(drawdown=-0.05, change_20d=0.15)
+   == price_pt2(drawdown=-0.05, change_20d=-0.05), True)
+# 절대 기준과 자기 이력 기준 중 낮은 쪽을 쓴다
+eq("이력상 평범하면 절대 만점이어도 깎임",
+   price_pt2(drawdown=-0.30, dd_pctile=0.3) < price_pt2(drawdown=-0.30), True)
+eq("이력 없으면 절대 기준만", price_pt2(drawdown=-0.10), 20.0)
+eq("둘 다 만점이면 만점", price_pt2(drawdown=-0.15, dd_pctile=1.0), 20.0)
+eq("고점 대비 % 를 값으로 노출",
+   [f for f in sc(ScoreInput('P', 100.0, 4.0, drawdown=-0.082)).facts
+    if f[0] == '가격 위치'][0][1], "고점 대비 -8.2%")
+# 이력 위치는 백분율이 아니라 '순위' 로 쓴다. '상위 85%' 는 심한 건지 평범한
+# 건지 즉시 안 읽힌다. dd_pctile 0.85 = 지금보다 덜 빠진 과거가 85% = 15번째.
+def dd_sub(**kw):
+    return [f for f in sc(ScoreInput('P', 100.0, 4.0, **kw)).facts
+            if f[0] == '가격 위치'][0][2]
+
+eq("이력 위치는 순위로 표시 (0.85 → 15번째)",
+   dd_sub(drawdown=-0.08, dd_pctile=0.85), "과거 낙폭 100건 중 15번째로 큼")
+eq("평범한 낙폭은 뒷순위 (0.15 → 85번째)",
+   dd_sub(drawdown=-0.08, dd_pctile=0.15), "과거 낙폭 100건 중 85번째로 큼")
+eq("역대 최악은 1번째",
+   dd_sub(drawdown=-0.30, dd_pctile=1.0), "과거 낙폭 100건 중 1번째로 큼")
+eq("헷갈리는 상위/하위 표기를 쓰지 않음",
+   any(w in dd_sub(drawdown=-0.08, dd_pctile=0.85) for w in ('상위', '하위')), False)
+# 점수에선 빠져도 경고는 유지해야 한다 — 원래 의도(하락 추세 주의)를 지킨다
+eq("하락추세 경고 유지", any('하락 추세' in w for w in
    sc(ScoreInput('P', 100.0, 4.0, ma200_slope=-0.04)).warnings), True)
+eq("단기 과열 경고 유지", any('단기 과열' in w for w in
+   sc(ScoreInput('P', 100.0, 4.0, change_20d=0.15)).warnings), True)
 
 # --- 배당률: 절대 수준과 위치 분리 ---
 # 이력 대비 위치만 보면 배당률 0.44% 인 QQQ 가 만점을 받는다.
