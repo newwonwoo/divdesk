@@ -37,9 +37,23 @@ while ((m = fnRe.exec(src))) {
     ...[...body.matchAll(/\.map\(\((\w+)/g)].map(x => x[1]),
   ].filter(Boolean))
 
-  // 부모가 전달을 끊기 쉬운 prop 만 본다. 속성 접근(a.items)은 제외해야 오탐이 없다.
-  for (const id of ['mode', 'etfs', 'onDoc', 'onChanged', 'reloadKey']) {
-    const used = new RegExp(`[^.\\w'"\`]${id}\\b(?!\\s*:)`).test(body.slice(m[0].length))
+  // prop 뿐 아니라 컴포넌트 안에서만 쓰는 상태·헬퍼도 본다.
+  // 리팩터링하다 setPicked 하나가 남아 계산 탭이 통째로 죽은 적이 있다.
+  // 속성 접근(a.items)은 정규식에서 제외해야 오탐이 없다.
+  const WATCH = [
+    'mode', 'etfs', 'onDoc', 'onChanged', 'reloadKey',
+    'picked', 'setPicked', 'toggle', 'setItems', 'sel', 'setSel',
+    'amt', 'setAmt', 'amount', 'setAmount', 'totalAmount', 'selMeta',
+    'onAdd', 'onRemove', 'cur', 'setCur', 'monthly', 'target', 'usable',
+  ]
+  for (const id of WATCH) {
+    // 앞에 점이 없고(속성 접근 아님), 뒤에 콜론이 없어야(객체 키 아님) 변수 참조다.
+    // 문자열·주석 안의 단어도 걸러야 오탐이 없다.
+    const code = body.slice(m[0].length)
+      .replace(/\/\/[^\n]*/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/'[^']*'|"[^"]*"|`[^`]*`/g, "''")
+    const used = new RegExp(`(^|[^.\\w$])${id}\\b(?!\\s*:)`).test(code)
     if (used && !declared.has(id) && !KNOWN.has(id)) {
       console.error(`  ✗ ${name}: '${id}' 를 쓰는데 정의가 없습니다`)
       bad++

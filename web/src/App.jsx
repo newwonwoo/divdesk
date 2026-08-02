@@ -42,21 +42,32 @@ function Notes({ items, title = '계산 기준과 주의사항' }) {
 
 const Err = ({ msg }) => msg ? <div className="warn">{msg}</div> : null
 
-function MonthStrip({ values }) {
-  const max = Math.max(...values, 1)
+// 만원 단위. 막대 위에 숫자가 없으면 높이만 보고 크기를 가늠해야 한다.
+const manwon = (v) => {
+  const n = Math.round(Number(v) / 10000)
+  return n > 0 ? n.toLocaleString('ko-KR') : ''
+}
+
+function MonthStrip({ values, labels, marks }) {
+  const max = Math.max(...values.map(v => Math.abs(Number(v) || 0)), 1)
+  if (!values.length || values.every(v => !v)) {
+    return <div className="empty">표시할 입금 내역이 없습니다.</div>
+  }
   return (
     <>
       <div className="strip">
         {values.map((v, i) => (
-          <div className="mo" key={i}>
-            <div className="bar" style={{ height: `${Math.max(2, (v / max) * 100)}%` }} />
-            <b>{i + 1}</b>
+          <div className="mo" key={i} title={`${won(v)}원`}>
+            <em className="mo-v">{manwon(v)}</em>
+            <div className={v > 0 ? (marks && marks[i] === false ? 'bar est' : 'bar') : 'bar zero'}
+              style={{ height: v > 0 ? `${Math.max(4, (v / max) * 100)}%` : '3px' }} />
+            <b>{labels ? labels[i] : i + 1}</b>
           </div>
         ))}
       </div>
       <div className="legend">
-        <span><i style={{ background: 'var(--in)' }} />세후 원화</span>
-        <span>비어 있는 달은 그 달에 입금이 없다는 뜻입니다</span>
+        <span>단위: 만원</span>
+        {marks && <><span><i className="sw" />확정</span><span><i className="sw est" />추정</span></>}
       </div>
     </>
   )
@@ -77,10 +88,6 @@ function Calculator({ etfs, onDoc }) {
 
   const usable = etfs.filter(e => e.close != null)
 
-  useEffect(() => {
-    // 계좌모드가 바뀌면 담을 수 있는 종목이 달라진다. 결과는 무효화한다.
-    setPicked([]); setData(null); setErr('')
-  }, [])
 
   const selMeta = usable.find(e => e.ticker === sel)
   const tickers = items.map(i => i.ticker)
@@ -265,11 +272,8 @@ function Projection({ etfs, onDoc }) {
   const [busy, setBusy] = useState(false)
 
   const usable = etfs.filter(e => e.market === 'US' && e.close != null)
-  const selMeta = usable.find(e => e.ticker === sel)
-  const tickers = items.map(i => i.ticker)
-  const totalAmount = items.reduce((a, i) => a + i.amount, 0)
-  const onAdd = (row) => setItems(p => [...p.filter(x => x.ticker !== row.ticker), row])
-  const onRemove = (t) => setItems(p => p.filter(x => x.ticker !== t))
+  const toggle = (t) =>
+    setPicked(p => p.includes(t) ? p.filter(x => x !== t) : [...p, t])
 
   const run = async () => {
     setBusy(true); setErr(''); setData(null)
@@ -728,7 +732,7 @@ function Calendar({ onDoc }) {
   return (
     <>
       <div className="card">
-        <h2>앞으로 12개월 <InfoBtn k="cal" onOpen={onDoc} /></h2>
+        <h2>앞으로 12개월 배당 <InfoBtn k="cal" onOpen={onDoc} /></h2>
         <div className="result" style={{ borderTop: 0, paddingTop: 0, marginTop: 0 }}>
           <div className="lbl">예상 수령 합계 (세후)</div>
           <div className="big">{won(total)}원</div>
@@ -1017,7 +1021,7 @@ export default function App() {
 
       <nav role="tablist">
         {[['home', '홈'], ['calc', '계산'], ['proj', '시뮬레이션'],
-          ['score', '타점'], ['cal', '실제CF추정'], ['ledger', '기록']].map(([k, label]) => (
+          ['score', '타점'], ['ledger', '기록']].map(([k, label]) => (
           <button key={k} role="tab" aria-selected={tab === k}
             onClick={() => { setTab(k); window.scrollTo(0, 0) }}>{label}</button>
         ))}
@@ -1029,7 +1033,7 @@ export default function App() {
       {tab === 'home' && (
         <>
           <Returns onDoc={setDoc} reloadKey={reloadKey} />
-          <Dashboard onDoc={setDoc} reloadKey={reloadKey} />
+          <Calendar onDoc={setDoc} key={reloadKey} />
         </>
       )}
       {tab === 'calc' && <Calculator etfs={etfs} onDoc={setDoc} />}
@@ -1040,7 +1044,6 @@ export default function App() {
           <Duplicates onDoc={setDoc} />
         </>
       )}
-      {tab === 'cal' && <Calendar onDoc={setDoc} key={reloadKey} />}
       {tab === 'ledger' && (
         <>
           <Ledger etfs={etfs} onDoc={setDoc}

@@ -68,7 +68,7 @@ label{display:block;font-size:13px;color:var(--ink-2);margin-bottom:5px}
 .row span:first-child{color:var(--ink-2)}
 .minus{color:var(--out)}
 
-.strip{display:flex;gap:4px;align-items:stretch;height:140px;margin-top:10px;
+.strip{display:flex;gap:4px;align-items:stretch;height:170px;margin-top:10px;
   padding:8px 0;border-bottom:2px solid var(--rule)}
 /* .mo 에 height:100% 가 없으면 자식 막대의 height:% 가 기준을 못 찾아
    아무것도 안 그려진다. 실제로 그 버그가 있었다. */
@@ -407,3 +407,17 @@ table.facts tr.ftot th{padding-top:11px;color:var(--ink);font-weight:700}
 table.facts tr.ftot .fp{padding-top:11px}
 table.facts tr.ftot .fp b{font-size:17px;color:var(--in)}
 .bar.zero{background:var(--rule)}
+
+/* 막대 위 금액(만원). 높이만으로는 크기를 가늠하기 어렵다. */
+.mo-v{
+  font-family:var(--mono);font-style:normal;font-size:11px;font-weight:700;
+  color:var(--in);flex:0 0 auto;margin-bottom:3px;line-height:1;
+}
+.bar.est{background:repeating-linear-gradient(-45deg,
+  var(--in),var(--in) 4px,#7FAEA8 4px,#7FAEA8 8px)}
+.legend i.sw{display:inline-block;width:10px;height:10px;background:var(--in);
+  border-radius:2px;margin-right:5px;vertical-align:-1px}
+.legend i.sw.est{background:repeating-linear-gradient(-45deg,
+  var(--in),var(--in) 3px,#7FAEA8 3px,#7FAEA8 6px)}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;
+  color:var(--ink-2);margin-top:10px}
