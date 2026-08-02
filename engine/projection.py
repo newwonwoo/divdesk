@@ -62,6 +62,8 @@ class Projection:
     loss_windows: int = 0            # 원금을 밑돈 경우의 수
     data_from: date | None = None
     data_to: date | None = None
+    full_from: date | None = None      # 잘라내기 전 이 종목의 실제 시작일
+    full_years: float = 0.0            # 이 종목이 가진 전체 이력 연수
     notes: list[str] = field(default_factory=list)
 
 
@@ -110,12 +112,18 @@ def simulate(ticker: str, series: list, monthly_krw: float, years: int,
     if years <= 0:
         raise ValueError("기간은 1년 이상이어야 합니다")
 
-    points = _monthly_points(series)
-    if since:
-        points = [p for p in points if p[0] >= since]
     need = years * 12
     result = Projection(ticker=ticker, monthly_krw=monthly_krw, years=years,
                         windows=0, total_invested_krw=monthly_krw * need)
+
+    all_points = _monthly_points(series)
+    if all_points:
+        result.full_from = all_points[0][0]
+        result.full_years = round(
+            (all_points[-1][0] - all_points[0][0]).days / 365.25, 1)
+    points = all_points
+    if since:
+        points = [p for p in points if p[0] >= since]
     if len(points) < need + 1:
         have = len(points) / 12
         result.notes.append(

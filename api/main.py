@@ -63,6 +63,28 @@ app.add_middleware(
 _store = Store()
 
 
+@app.on_event("startup")
+def apply_migrations() -> None:
+    """서버가 켜질 때 스키마를 스스로 맞춘다.
+
+    이걸 사람이 하게 두면 배포마다 ALTER TABLE 을 빠뜨려 500 이 난다.
+    실제로 여러 번 그랬고, 그때마다 원인을 찾느라 시간을 썼다.
+    """
+    try:
+        from db.migrate import run as run_migrations
+        conn = _store.connect()
+        if conn is not None:
+            result = run_migrations(conn)
+            if result["failed"]:
+                print(f"[migrate] {len(result['failed'])}건 실패: "
+                      f"{[f[0] for f in result['failed']]}")
+            else:
+                print(f"[migrate] 스키마 {result['applied']}건 확인 완료")
+    except Exception as exc:                                  # noqa: BLE001
+        # 마이그레이션 실패로 서버가 안 뜨면 더 나쁘다. 로그만 남기고 계속 간다.
+        print(f"[migrate] 건너뜀: {type(exc).__name__}: {exc}")
+
+
 def db():
     try:
         conn = _store.connect()
@@ -614,6 +636,7 @@ class ProjectionReq(BaseModel):
     years: int = Field(gt=0, le=30)
     tickers: list[str]
     with_benchmark: bool = True
+    currency: str = "USD"        # USD 또는 KRW. 입력 금액의 통화
 
 
 @app.post("/projection")
@@ -625,6 +648,11 @@ def projection(req: ProjectionReq):
         benchmarks = [r["ticker"] for r in rows(
             "SELECT ticker FROM etf_master WHERE is_benchmark ORDER BY ticker")]
         targets += [b for b in benchmarks if b not in targets]
+
+    # 원화로 넣으면 현재 환율로 달러 환산해 계산한다. 수익률 자체는 달러 기준이며,
+    # 결과를 다시 원화로 곱해 보여준다. 환율 변동은 어느 쪽이든 반영하지 않는다.
+    fx_now, _ = latest_fx()
+    monthly = (req.monthly_usd / fx_now if req.currency == "KRW" else req.monthly_usd)
 
     series_map, missing = {}, []
     for ticker in targets:
@@ -657,7 +685,7 @@ def projection(req: ProjectionReq):
     results = []
     for ticker, series in eligible.items():
         try:
-            results.append(simulate(ticker, series, req.monthly_usd,
+            results.append(simulate(ticker, series, monthly,
                                     req.years, since=since))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -668,11 +696,15 @@ def projection(req: ProjectionReq):
     payload = compare_projections(results)
     fx, fx_date = latest_fx()
     return {
-        "monthly_usd": req.monthly_usd, "years": req.years,
-        "total_invested_usd": round(req.monthly_usd * req.years * 12, 2),
+        "monthly_usd": round(monthly, 2),
+        "monthly_input": req.monthly_usd, "currency": req.currency,
+        "years": req.years,
+        "total_invested_usd": round(monthly * req.years * 12, 2),
+        "total_invested_krw": round(monthly * req.years * 12 * fx),
         "fx": fx, "fx_date": fx_date,
-        "fx_note": (f"원화 금액은 현재 환율 {fx:,.1f}원을 곱한 참고값입니다. "
-                    "환율 변동은 반영하지 않았습니다."),
+        "fx_note": (f"환율 {fx:,.1f}원 고정 가정입니다. "
+                    "10년 뒤 환율은 알 수 없고, 과거 환율로 굴리면 환율 추세가 섞여 "
+                    "종목 비교가 흐려지므로 계산에서 제외했습니다."),
         "benchmarks": benchmarks, "no_data": missing,
         "common_start": since,
         "excluded_short_history": too_short,
@@ -696,6 +728,8 @@ def projection(req: ProjectionReq):
             "best_final_usd": round(p.best.final_value, 2) if p.best else None,
             "worst_start": p.worst.start if p.worst else None,
             "loss_windows": p.loss_windows,
+            "data_from": p.full_from,
+            "data_years": p.full_years,
             "notes": p.notes,
         } for p in payload.get("items", results)],
     }

@@ -50,7 +50,7 @@ class ScoreResult:
     fx_pos: float
     exdate_pen: float
     reason: str
-    # [(라벨, 값, 부연)] — 화면이 한 덩어리 문장 대신 표로 그린다
+    # [(라벨, 값, 부연, 획득점수, 만점)] — 화면이 표로 그리고 합계를 검산할 수 있다
     facts: list = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
@@ -68,13 +68,13 @@ def _pctile(value: float, series: list[float]) -> float | None:
 def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
     today = today or date.today()
     reasons: list[str] = []
-    facts: list = []
     warnings: list[str] = []
     missing: list[str] = []
 
     # ① 배당률 백분위 (30) — 자기 과거 대비 지금 배당률이 높으면 싸다는 뜻
     cur_yield = (inp.ttm_dps / inp.price * 100) if inp.price else 0.0
     pct = _pctile(cur_yield, inp.yield_history)
+    band = ""
     if pct is None:
         yield_pt = W_YIELD * 0.5
         missing.append("배당률 이력 부족 — 중립 처리")
@@ -87,7 +87,6 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
         else:
             band = f"자기 이력 중간 {pct:.0%} 지점"
         reasons.append(f"배당률 {cur_yield:.2f}% — {band}")
-        facts.append(("배당률", f"{cur_yield:.2f}%", band))
 
     # ② 가격 위치 (20) — 200일선 아래 + 52주 하단이면 가점
     price_pt, price_bits = 0.0, []
@@ -107,16 +106,12 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
         missing.append("52주 고저 없음")
     if price_bits:
         reasons.append(" · ".join(price_bits))
-        facts.append(("가격 위치", price_bits[0], price_bits[1] if len(price_bits) > 1 else ""))
 
     # ③ 분배금 건강도 (20) — 늘고 있으면 가점, 줄면 감점, 감액 이력은 별도 감점
     if inp.dps_ttm_prev and inp.dps_ttm_prev > 0:
         growth = (inp.ttm_dps - inp.dps_ttm_prev) / inp.dps_ttm_prev
         dps_pt = W_DPS * max(0.0, min(1.0, 0.5 + growth * 5))
         reasons.append(f"분배금 12개월 {growth:+.1%}")
-        facts.append(("분배금", f"{growth:+.1%}", "최근 12개월"))
-        if growth < -0.10:
-            warnings.append(f"분배금이 1년 새 {growth:.1%} 줄었습니다")
     else:
         dps_pt = W_DPS * 0.5
         missing.append("직전 연도 분배금 없음 — 중립 처리")
@@ -129,8 +124,6 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
         ret_pt = W_RET * 0.5
         missing.append("1년 총수익률 없음 — 중립 처리")
     else:
-        facts.append(("1년 총수익", f"{inp.total_return_1y_pct:+.1f}%",
-                      f"분배율 {cur_yield:.1f}%"))
         diff = inp.total_return_1y_pct - cur_yield
         ret_pt = W_RET * max(0.0, min(1.0, 0.5 + diff / 20))
         if diff < -2:
@@ -139,41 +132,65 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
                 "낮습니다 — 분배금이 원금을 깎고 있을 수 있습니다")
 
     # ⑤ 환율 위치 (10) — 원화 투자자 관점. 환율이 높을 때 사면 불리
+    fx_label, fx_sub = "미상", ""
     if inp.is_krw_listed:
         fx_pt = W_FX                      # 국내상장 원화매수는 환 시점 리스크가 작다
+        fx_label, fx_sub = "해당 없음", "원화 상장"
         reasons.append("원화 상장 — 환율 시점 부담 없음")
-        facts.append(("환율", "해당 없음", "원화 상장"))
     else:
         fx_now = inp.fx_now
         fx_pct = _pctile(fx_now, inp.fx_history) if fx_now else None
         if fx_pct is None:
             fx_pt = W_FX * 0.5
+            fx_label = "이력 부족"
             missing.append("환율 이력 부족 — 중립 처리")
         else:
             fx_pt = W_FX * (1 - fx_pct)
+            fx_label = f"{fx_now:,.0f}원"
+            fx_sub = f"3년 밴드 {fx_pct:.0%}" + (" · 비싼 구간" if fx_pct >= 0.7 else "")
             reasons.append(f"환율 {fx_now:,.0f}원 — 3년 밴드 {fx_pct:.0%} 지점"
                            + (" (비싼 구간)" if fx_pct >= 0.7 else ""))
-            facts.append(("환율", f"{fx_now:,.0f}원",
-                          f"3년 밴드 {fx_pct:.0%}" + (" · 비싼 구간" if fx_pct >= 0.7 else "")))
             if fx_pct > 0.8:
                 warnings.append("환율이 3년 상단권입니다 — 환차손 위험을 감안하세요")
 
     # ⑥ 배당락 타이밍 (10) — 배당락 직전 매수는 가격에 배당이 이미 붙어 있다
+    ex_sub = ""
     if inp.days_to_ex is None:
         ex_pt = W_EX * 0.5
         missing.append("다음 배당락일 미상 — 중립 처리")
     elif inp.days_to_ex <= 3:
         ex_pt = W_EX * 0.2
+        ex_sub = "임박 — 지금 사면 고점"
         reasons.append(f"배당락 D-{inp.days_to_ex} — 지금 사면 고점 매수가 됩니다")
-        facts.append(("배당락", f"D-{inp.days_to_ex}", "임박 — 지금 사면 고점"))
     elif inp.days_to_ex <= 10:
         ex_pt = W_EX * 0.5
+        ex_sub = "가까움"
         reasons.append(f"배당락 D-{inp.days_to_ex}")
-        facts.append(("배당락", f"D-{inp.days_to_ex}", ""))
     else:
         ex_pt = W_EX
+        ex_sub = "여유 있음"
         reasons.append(f"배당락까지 {inp.days_to_ex}일 여유")
-        facts.append(("배당락", f"{inp.days_to_ex}일 뒤", "여유 있음"))
+
+    # 항목별 (라벨, 값, 부연, 획득점수, 만점).
+    # 점수가 다 나온 뒤 한 번에 조립한다. 계산 중간에 담으면
+    # 아직 값이 없는 변수를 참조하게 된다.
+    facts = [
+        ("배당률", f"{cur_yield:.2f}%", band or "이력 부족", round(yield_pt, 1), W_YIELD),
+        ("가격 위치",
+         price_bits[0] if price_bits else "데이터 없음",
+         price_bits[1] if len(price_bits) > 1 else "",
+         round(price_pt, 1), W_PRICE),
+        ("분배금",
+         f"{growth:+.1%}" if inp.dps_ttm_prev else "이력 부족",
+         "최근 12개월 증감", round(dps_pt, 1), W_DPS),
+        ("1년 총수익",
+         f"{inp.total_return_1y_pct:+.1f}%" if inp.total_return_1y_pct is not None else "데이터 없음",
+         f"분배율 {cur_yield:.1f}%", round(ret_pt, 1), W_RET),
+        ("환율", fx_label, fx_sub, round(fx_pt, 1), W_FX),
+        ("배당락",
+         f"{inp.days_to_ex}일 뒤" if inp.days_to_ex is not None else "미상",
+         ex_sub, round(ex_pt, 1), W_EX),
+    ]
 
     total = round(yield_pt + price_pt + dps_pt + ret_pt + fx_pt + ex_pt)
     total = max(0, min(100, total))

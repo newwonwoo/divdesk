@@ -49,10 +49,11 @@ export const label = (item) => {
   return item.market === 'KR' ? name : `${item.ticker} ${name}`
 }
 
-// 좁은 화면용 짧은 이름
+// 국내는 브랜드가 곧 종목 구분이다. TIGER·KODEX 를 지우면
+// "고배당주"·"고배당"만 남아 어느 상품인지 알 수 없다. 전체 이름을 쓴다.
 export const shortLabel = (item) => {
   if (!item) return ''
-  if (item.market === 'KR') return (item.name || item.ticker).replace(/^(TIGER|KODEX|ACE|SOL|PLUS|KoAct|RISE) /, '')
+  if (item.market === 'KR') return item.name || item.ticker
   return item.ticker
 }
 

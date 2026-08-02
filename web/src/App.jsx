@@ -67,9 +67,10 @@ function MonthStrip({ values }) {
 function Calculator({ etfs, onDoc }) {
   const [mode, setMode] = useState('US_TAXABLE')
   const [dir, setDir] = useState('forward')
-  const [amount, setAmount] = useState('50,000,000')
   const [target, setTarget] = useState('1,000,000')
-  const [picked, setPicked] = useState([])
+  const [items, setItems] = useState([])
+  const [sel, setSel] = useState('')
+  const [amt, setAmt] = useState('')
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -81,15 +82,23 @@ function Calculator({ etfs, onDoc }) {
     setPicked([]); setData(null); setErr('')
   }, [])
 
-  const toggle = (t) =>
-    setPicked(p => p.includes(t) ? p.filter(x => x !== t) : [...p, t])
+  const selMeta = usable.find(e => e.ticker === sel)
+  const tickers = items.map(i => i.ticker)
+  const totalAmount = items.reduce((a, i) => a + i.amount, 0)
+  const onAdd = (row) => setItems(p => [...p.filter(x => x.ticker !== row.ticker), row])
+  const onRemove = (t) => setItems(p => p.filter(x => x.ticker !== t))
 
   const run = async () => {
     setBusy(true); setErr(''); setData(null)
     try {
       const body = dir === 'forward'
-        ? await api.forward({ amount_krw: uncomma(amount), tickers: picked, account_mode: mode })
-        : await api.reverse({ target_monthly_krw: uncomma(target), tickers: picked, account_mode: mode })
+        ? await api.forward({
+            amount_krw: totalAmount, tickers, account_mode: mode,
+            weights: Object.fromEntries(items.map(i => [i.ticker, i.amount])),
+          })
+        : await api.reverse({
+            target_monthly_krw: uncomma(target), tickers, account_mode: mode,
+          })
       setData(body)
     } catch (e) { setErr(e.message) } finally { setBusy(false) }
   }
@@ -118,18 +127,9 @@ function Calculator({ etfs, onDoc }) {
           </button>
         </div>
 
-        {dir === 'forward' ? (
+        {dir === 'reverse' && (
           <>
-            <label>투자 원금</label>
-            <div className="field">
-              <input inputMode="numeric" value={amount}
-                onChange={e => setAmount(commafy(e.target.value))} />
-              <em>원</em>
-            </div>
-          </>
-        ) : (
-          <>
-            <label>목표 월배당 (세후)</label>
+            <label style={{ marginTop: 14 }}>목표 월배당 (세후)</label>
             <div className="field">
               <input inputMode="numeric" value={target}
                 onChange={e => setTarget(commafy(e.target.value))} />
@@ -139,27 +139,60 @@ function Calculator({ etfs, onDoc }) {
         )}
 
         <div style={{ marginTop: 16 }}>
-          <label>담을 종목 {picked.length > 0 && `(${picked.length}개)`}</label>
+          <label>담을 종목과 금액</label>
           {usable.length === 0
             ? <div className="empty">수집된 가격 데이터가 있는 종목이 없습니다.</div>
-            : <div className="picklist">
-                {usable.map(e => (
-                  <button key={e.ticker} className="pick"
-                    aria-pressed={picked.includes(e.ticker)}
-                    onClick={() => toggle(e.ticker)}>
-                    <span className="pick-name">{label(e)}</span>
-                    <span className="pick-meta">
-                      {e.strategy}
-                      {e.expense_ratio != null && ` · 보수 ${e.expense_ratio}%`}
-                      {e.score != null && ` · 타점 ${e.score}점`}
-                      {e.is_covered_call && ' · 분배금 ≠ 수익'}
-                    </span>
-                  </button>
-                ))}
-              </div>}
+            : <>
+                <select value={sel} onChange={e => setSel(e.target.value)}>
+                  <option value="">종목 선택</option>
+                  {usable.map(e => (
+                    <option key={e.ticker} value={e.ticker}>{label(e)}</option>
+                  ))}
+                </select>
+                {selMeta && (
+                  <div className="pick-info">
+                    <span className="tag">{selMeta.strategy}</span>
+                    {selMeta.expense_ratio != null &&
+                      <span className="tag">보수 {selMeta.expense_ratio}%</span>}
+                    {selMeta.score != null && <span className="tag">타점 {selMeta.score}점</span>}
+                    {selMeta.is_covered_call &&
+                      <span className="tag warn-tag">분배금 ≠ 수익</span>}
+                  </div>
+                )}
+                <div className="field" style={{ marginTop: 12 }}>
+                  <input inputMode="numeric" placeholder="금액" value={amt}
+                    onChange={e => setAmt(commafy(e.target.value))} />
+                  <em>원</em>
+                </div>
+                <button className="btn ghost" disabled={!sel || uncomma(amt) <= 0}
+                  onClick={() => {
+                    onAdd({ ticker: sel, amount: uncomma(amt), meta: selMeta })
+                    setSel(''); setAmt('')
+                  }}>담기</button>
+
+                {items.length > 0 && (
+                  <div className="picked">
+                    {items.map(i => (
+                      <div className="picked-row" key={i.ticker}>
+                        <span>{label(i.meta) || i.ticker}</span>
+                        <b className="num">{won(i.amount)}원</b>
+                        <button className="del"
+                          onClick={() => onRemove(i.ticker)}>삭제</button>
+                      </div>
+                    ))}
+                    <div className="picked-row total">
+                      <span>합계 {items.length}종목</span>
+                      <b className="num">{won(totalAmount)}원</b>
+                      <span />
+                    </div>
+                  </div>
+                )}
+              </>}
         </div>
 
-        <button className="btn" disabled={busy || !picked.length} onClick={run}>
+        <button className="btn"
+          disabled={busy || !items.length || (dir === 'forward' && totalAmount <= 0)}
+          onClick={run}>
           {busy ? '계산 중…' : '계산하기'}
         </button>
         <Err msg={err} />
@@ -225,20 +258,25 @@ function Calculator({ etfs, onDoc }) {
 function Projection({ etfs, onDoc }) {
   const [picked, setPicked] = useState(['SCHD'])
   const [monthly, setMonthly] = useState('500')
+  const [cur, setCur] = useState('USD')
   const [years, setYears] = useState(10)
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
 
   const usable = etfs.filter(e => e.market === 'US' && e.close != null)
-  const toggle = (t) =>
-    setPicked(p => p.includes(t) ? p.filter(x => x !== t) : [...p, t])
+  const selMeta = usable.find(e => e.ticker === sel)
+  const tickers = items.map(i => i.ticker)
+  const totalAmount = items.reduce((a, i) => a + i.amount, 0)
+  const onAdd = (row) => setItems(p => [...p.filter(x => x.ticker !== row.ticker), row])
+  const onRemove = (t) => setItems(p => p.filter(x => x.ticker !== t))
 
   const run = async () => {
     setBusy(true); setErr(''); setData(null)
     try {
       setData(await api.projection({
-        monthly_usd: Number(monthly), years, tickers: picked,
+        monthly_usd: cur === 'KRW' ? uncomma(monthly) : Number(monthly),
+        currency: cur, years, tickers: picked,
       }))
     } catch (e) { setErr(e.message) } finally { setBusy(false) }
   }
@@ -248,11 +286,22 @@ function Projection({ etfs, onDoc }) {
       <div className="card">
         <h2>적립 시뮬레이션 <InfoBtn k="proj" onOpen={onDoc} /></h2>
 
-        <label>매달 넣을 금액</label>
+        <label>통화</label>
+        <div className="dir">
+          {[['USD', '달러 $'], ['KRW', '원화 ₩']].map(([k, t]) => (
+            <button key={k} aria-selected={cur === k}
+              onClick={() => { setCur(k); setMonthly(k === 'USD' ? '500' : '700,000'); setData(null) }}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        <label style={{ marginTop: 16 }}>매달 넣을 금액</label>
         <div className="field">
-          <em style={{ paddingLeft: 0, paddingRight: 6 }}>$</em>
+          <em style={{ paddingLeft: 0, paddingRight: 8 }}>{cur === 'USD' ? '$' : '₩'}</em>
           <input inputMode="numeric" value={monthly}
-            onChange={e => setMonthly(e.target.value.replace(/[^0-9]/g, ''))} />
+            onChange={e => setMonthly(cur === 'KRW'
+              ? commafy(e.target.value) : e.target.value.replace(/[^0-9]/g, ''))} />
         </div>
 
         <label style={{ marginTop: 16 }}>기간</label>
@@ -263,12 +312,18 @@ function Projection({ etfs, onDoc }) {
           ))}
         </div>
 
-        <label style={{ marginTop: 16 }}>비교할 종목</label>
-        <div className="chips">
+        <label style={{ marginTop: 16 }}>매수 종목</label>
+        <div className="picklist">
           {usable.map(e => (
-            <button key={e.ticker} className="chip" aria-pressed={picked.includes(e.ticker)}
+            <button key={e.ticker} className="pick" aria-pressed={picked.includes(e.ticker)}
               onClick={() => toggle(e.ticker)}>
-              {e.ticker}{e.is_covered_call ? ' ⚠' : ''}
+              <span className="pick-name">{label(e)}</span>
+              <span className="pick-meta">
+                {e.strategy}
+                {e.expense_ratio != null && ` · 보수 ${e.expense_ratio}%`}
+                {e.score != null && ` · 타점 ${e.score}점`}
+                {e.is_covered_call && ' · 분배금 ≠ 수익'}
+              </span>
             </button>
           ))}
         </div>
@@ -285,9 +340,11 @@ function Projection({ etfs, onDoc }) {
         <div className="card">
           <h2>{data.years}년 뒤 예상</h2>
           <div className="hero-sub">
-            매달 ${Number(monthly).toLocaleString()} × {data.years * 12}개월 ·
-            총 ${data.total_invested_usd.toLocaleString()} 투입
-            <br />= {won(data.total_invested_usd * data.fx)}원 (현재 환율 기준)
+            매달 {data.currency === 'KRW'
+              ? `${won(uncomma(monthly))}원 (약 $${Math.round(data.monthly_usd)})`
+              : `$${Number(monthly).toLocaleString()}`} × {data.years * 12}개월
+            <br />총 ${data.total_invested_usd.toLocaleString()} ·
+            {' '}{won(data.total_invested_krw)}원 투입
           </div>
 
           {data.results.map(r => (
@@ -302,6 +359,10 @@ function Projection({ etfs, onDoc }) {
                   {r.loss_windows > 0 && (
                     <span style={{ color: 'var(--out)' }}>원금 미달 {r.loss_windows}회</span>
                   )}
+                </div>
+                <div className="hint">
+                  데이터 {r.data_from?.slice(0, 7)}부터 {r.data_years}년치 ·
+                  시작 시점 {r.windows}가지 시험
                 </div>
               </div>
               <div className="row-right">
@@ -394,14 +455,28 @@ function Screener({ onDoc }) {
             <div className="etf-main">
               <div className="tk">{shortLabel(e)}<small>{e.strategy}</small></div>
               {e.facts?.length > 0
-                ? <dl className="facts">
-                    {e.facts.map(([k, v, sub], i) => (
-                      <div key={i}>
-                        <dt>{k}</dt>
-                        <dd><b>{v}</b>{sub && <span>{sub}</span>}</dd>
-                      </div>
-                    ))}
-                  </dl>
+                ? <table className="facts">
+                    <tbody>
+                      {e.facts.map(([k, v, sub, got, max], i) => (
+                        <tr key={i}>
+                          <th>{k}</th>
+                          <td className="fv">{v}</td>
+                          <td className="fs">{sub}</td>
+                          <td className="fp">
+                            <span className="bar-wrap">
+                              <span className="bar-fill"
+                                style={{ width: `${Math.round((got / max) * 100)}%` }} />
+                            </span>
+                            <b>{got}</b><s>/{max}</s>
+                          </td>
+                        </tr>
+                      ))}
+                      <tr className="ftot">
+                        <th>합계</th><td /><td />
+                        <td className="fp"><b>{e.total}</b><s>/100</s></td>
+                      </tr>
+                    </tbody>
+                  </table>
                 : <div className="why">{why?.trim()}</div>}
               {e.is_covered_call && (
                 <button className="badge" onClick={() => onDoc('cc')}>분배금 ≠ 수익</button>
@@ -940,6 +1015,15 @@ export default function App() {
         </div>
       </header>
 
+      <nav role="tablist">
+        {[['home', '홈'], ['calc', '계산'], ['proj', '시뮬레이션'],
+          ['score', '타점'], ['cal', '실제CF추정'], ['ledger', '기록']].map(([k, label]) => (
+          <button key={k} role="tab" aria-selected={tab === k}
+            onClick={() => { setTab(k); window.scrollTo(0, 0) }}>{label}</button>
+        ))}
+      </nav>
+
+
       <Err msg={err} />
 
       {tab === 'home' && (
@@ -965,13 +1049,6 @@ export default function App() {
         </>
       )}
 
-      <nav role="tablist">
-        {[['home', '홈'], ['calc', '계산'], ['proj', '전망'],
-          ['score', '타점'], ['cal', '일지'], ['ledger', '기록']].map(([k, label]) => (
-          <button key={k} role="tab" aria-selected={tab === k}
-            onClick={() => { setTab(k); window.scrollTo(0, 0) }}>{label}</button>
-        ))}
-      </nav>
 
       <Sheet docKey={doc} onClose={() => setDoc(null)} />
     </div>
