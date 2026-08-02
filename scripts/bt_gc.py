@@ -177,4 +177,35 @@ def main() -> int:
             print(f"  {label}: 표본 부족")
             continue
         y, n, ny, nn = res
-        print(f"  {label:<18} GC있음
+        print(f"  {label:<18} GC있음 {pct(y)} (n{ny}) / GC없음 {pct(n)} (n{nn}) "
+              f"| 차 {pct(y - n)}")
+    res = split_mean(cheap, "usd", lambda r: r["gc_fresh"] > 0)
+    if res:
+        y, n, ny, nn = res
+        print(f"  {'싼 구간·최근돌파':<18} 있음 {pct(y)} (n{ny}) / 없음 {pct(n)} (n{nn}) "
+              f"| 차 {pct(y - n)}")
+
+    # 반대 방향 — GC 상태 안에서 낙폭이 여전히 작동하는가
+    print("\n[역방향 — 골든크로스 상태에서 낙폭이 여전히 작동하는가]")
+    for label, sub in (("GC 있음", [r for r in usd if r["gc_state"]]),
+                       ("GC 없음", [r for r in usd if not r["gc_state"]])):
+        c = corr(sub, "dd_pos", "usd")
+        print(f"  {label:<8} n{len(sub):5d} 낙폭 상관 {c:+.3f}" if c is not None
+              else f"  {label:<8} n/a")
+
+    # 조합 점수: 낙폭 + 골든크로스 가점
+    print("\n[조합 점수 — 낙폭 단독 vs 낙폭+GC]")
+    for r in usd:
+        r["combo"] = r["dd_pos"] * (1.0 + 0.5 * r["gc_state"])
+    print(f"{'방식':<14}{'상관':>9}{'동일종목차':>11}{'양(+)':>9}"
+          f"{'~2021':>10}{'2022~':>10}")
+    print(line(usd, "dd_pos", "usd", "낙폭 단독"))
+    print(line(usd, "combo", "usd", "낙폭×GC가점"))
+
+    print("\n주의: 12개월 창 중첩으로 유효 독립표본은 표시 n 보다 훨씬 적다. "
+          "두 기간의 부호 일관성과 조합 효과만 읽을 것.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
