@@ -1,233 +1,287 @@
-"""적립 투자 시뮬레이션.
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DivDesk 목업 — 배당ETF 매수검토기</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#0F1E3D;        /* 통장 잉크 */
+  --ink-2:#4A5872;
+  --paper:#E9EDF2;      /* 명세서 용지 */
+  --card:#FFFFFF;
+  --rule:#C8D1DD;       /* 괘선 */
+  --in:#0E6F63;         /* 입금(배당) */
+  --out:#A63A18;        /* 차감(세금·배당락) */
+  --gold:#8A6D1F;       /* 관망 */
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--paper);color:var(--ink);
+  font-family:Pretendard,-apple-system,sans-serif;
+  font-size:15px;line-height:1.5;
+  padding-bottom:80px;
+}
+.num{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums}
+.wrap{max-width:460px;margin:0 auto;padding:0 16px}
 
-"매달 100만원씩 10년 넣으면 얼마가 되나?"에 답한다.
+/* 헤더 */
+header{padding:20px 0 14px}
+.brand{display:flex;align-items:baseline;gap:8px}
+.brand h1{font-size:19px;font-weight:800;letter-spacing:-.03em}
+.brand span{font-size:11px;color:var(--ink-2);letter-spacing:.08em}
+.asof{margin-top:4px;font-size:11px;color:var(--ink-2)}
 
-**단일 숫자를 내지 않는다.** 과거 평균 수익률로 복리를 굴려 "10년 뒤 3억"이라고
-말하는 건 거짓말에 가깝다. 언제 시작했느냐에 따라 결과가 두 배 넘게 갈리기 때문이다.
+/* 계좌모드 세그먼트 */
+.seg{display:flex;border:1px solid var(--ink);border-radius:2px;overflow:hidden;margin-top:14px}
+.seg button{flex:1;padding:9px 4px;font-size:12px;font-weight:600;background:transparent;
+  border:0;border-right:1px solid var(--rule);color:var(--ink-2);cursor:pointer;font-family:inherit}
+.seg button:last-child{border-right:0}
+.seg button[aria-selected=true]{background:var(--ink);color:#fff}
 
-그래서 실제 과거 데이터 위에서 **시작 시점을 바꿔가며 여러 번 돌린다**(롤링 백테스트).
-2015년 1월에 시작한 경우, 2015년 2월에 시작한 경우… 각각의 결과를 모아
-최악·중간·최선을 함께 보여준다. 범위를 보여주는 것이 정직하다.
+/* 카드 */
+.card{background:var(--card);border:1px solid var(--rule);border-radius:3px;padding:16px;margin-top:14px}
+.card h2{font-size:12px;font-weight:700;letter-spacing:.1em;color:var(--ink-2);
+  text-transform:uppercase;display:flex;align-items:center;gap:6px;margin-bottom:12px}
 
-수정종가(adj_close)를 쓰므로 분배금 재투자가 반영된 총수익 기준이다.
-"""
-from __future__ import annotations
+/* ⓘ 버튼 */
+.info{width:17px;height:17px;border-radius:50%;border:1px solid var(--rule);
+  background:#fff;color:var(--ink-2);font-size:11px;font-weight:700;line-height:1;
+  cursor:pointer;flex:0 0 auto;font-family:inherit}
+.info:hover,.info:focus-visible{background:var(--ink);color:#fff;border-color:var(--ink);outline:none}
 
-import statistics
-from dataclasses import dataclass, field
-from datetime import date
+/* 입력 */
+label{display:block;font-size:12px;color:var(--ink-2);margin-bottom:5px}
+.field{display:flex;align-items:center;border-bottom:1.5px solid var(--ink);padding-bottom:6px}
+.field input{flex:1;border:0;background:transparent;font-size:24px;font-weight:700;
+  text-align:right;color:var(--ink);outline:none;font-family:'JetBrains Mono',monospace}
+.field em{font-style:normal;font-size:13px;color:var(--ink-2);padding-left:6px}
+.dir{display:flex;gap:0;margin-bottom:16px}
+.dir button{flex:1;padding:8px;font-size:12.5px;font-weight:600;background:#fff;font-family:inherit;
+  border:1px solid var(--rule);color:var(--ink-2);cursor:pointer}
+.dir button[aria-selected=true]{background:#DDE6E4;border-color:var(--in);color:var(--in)}
 
+/* 결과 큰 숫자 */
+.result{margin-top:18px;padding-top:14px;border-top:1px dashed var(--rule)}
+.result .big{font-family:'JetBrains Mono',monospace;font-size:34px;font-weight:700;
+  letter-spacing:-.02em;color:var(--in);line-height:1.1}
+.result .lbl{font-size:11.5px;color:var(--ink-2);letter-spacing:.04em}
+.rows{margin-top:12px;font-size:13px}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dotted var(--rule)}
+.row:last-child{border-bottom:0}
+.row span:first-child{color:var(--ink-2)}
+.minus{color:var(--out)}
 
-@dataclass
-class Scenario:
-    start: date
-    end: date
-    invested: float
-    final_value: float
+/* 시그니처: 12개월 입금 스트립 */
+.strip{display:flex;gap:3px;align-items:flex-end;height:96px;margin-top:6px}
+.mo{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px}
+.bar{width:100%;background:var(--in);border-radius:1px 1px 0 0}
+.bar.est{background:repeating-linear-gradient(-45deg,#0E6F63,#0E6F63 3px,#7FAEA8 3px,#7FAEA8 6px)}
+.mo b{font-family:'JetBrains Mono',monospace;font-size:9px;font-weight:400;color:var(--ink-2)}
+.legend{display:flex;gap:12px;font-size:10.5px;color:var(--ink-2);margin-top:8px}
+.legend i{display:inline-block;width:9px;height:9px;margin-right:4px;vertical-align:-1px}
 
-    @property
-    def profit(self) -> float:
-        return self.final_value - self.invested
+/* 종목 카드 */
+.etf{display:flex;gap:12px;padding:13px 0;border-bottom:1px solid var(--rule);align-items:center}
+.etf:last-child{border-bottom:0}
+.score{width:46px;height:46px;flex:0 0 auto;border-radius:2px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;color:#fff}
+.score b{font-family:'JetBrains Mono',monospace;font-size:19px;line-height:1}
+.score s{text-decoration:none;font-size:8.5px;letter-spacing:.06em}
+.s-buy{background:var(--in)}.s-hold{background:var(--gold)}.s-wait{background:#7A8598}
+.etf-main{flex:1;min-width:0}
+.tk{font-weight:800;font-size:15px;letter-spacing:-.01em}
+.tk small{font-weight:500;font-size:11.5px;color:var(--ink-2);margin-left:6px}
+.why{font-size:11.5px;color:var(--ink-2);margin-top:3px}
+.badge{display:inline-block;font-size:9.5px;font-weight:700;padding:2px 5px;margin-top:5px;
+  border:1px solid var(--out);color:var(--out);border-radius:2px}
+.yld{text-align:right;flex:0 0 auto}
+.yld b{font-family:'JetBrains Mono',monospace;font-size:15px}
+.yld s{display:block;text-decoration:none;font-size:9.5px;color:var(--ink-2)}
 
-    @property
-    def return_pct(self) -> float:
-        return (self.final_value / self.invested - 1) * 100 if self.invested else 0.0
+/* 매수기록 */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-size:10px;letter-spacing:.08em;color:var(--ink-2);font-weight:600;
+  padding:0 0 7px;border-bottom:1px solid var(--ink)}
+td{padding:9px 0;border-bottom:1px dotted var(--rule)}
+td.n{text-align:right;font-family:'JetBrains Mono',monospace}
+.warn{margin-top:14px;padding:11px 13px;background:#FBF0EA;border-left:3px solid var(--out);font-size:12px}
 
-    @property
-    def annualized_pct(self) -> float:
-        """연평균 수익률. 적립식은 돈이 들어간 기간이 제각각이라
-        단순 CAGR이 아니라 평균 투자기간(약 절반)을 반영해 근사한다."""
-        years = (self.end - self.start).days / 365.25
-        if years <= 0 or self.invested <= 0:
-            return 0.0
-        avg_years = years / 2 + 0.5      # 매달 넣으면 평균 보유기간은 대략 절반
-        ratio = self.final_value / self.invested
-        return ((ratio ** (1 / avg_years)) - 1) * 100 if ratio > 0 else 0.0
+/* 하단 탭 */
+nav{position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--rule);display:flex}
+nav button{flex:1;padding:11px 0 13px;background:none;border:0;font-family:inherit;
+  font-size:11px;font-weight:600;color:var(--ink-2);cursor:pointer}
+nav button[aria-selected=true]{color:var(--in);box-shadow:inset 0 2px 0 var(--in)}
+.page{display:none}.page.on{display:block}
 
+/* 바텀시트 */
+.sheet{position:fixed;inset:0;background:rgba(15,30,61,.45);display:none;align-items:flex-end;z-index:9}
+.sheet.on{display:flex}
+.sheet-in{background:#fff;width:100%;max-width:460px;margin:0 auto;padding:20px 18px 26px;
+  border-radius:8px 8px 0 0}
+.sheet h3{font-size:15px;font-weight:800;margin-bottom:9px}
+.sheet p{font-size:13px;color:#28344B;margin-bottom:9px}
+.sheet code{font-family:'JetBrains Mono',monospace;font-size:11.5px;background:var(--paper);
+  padding:2px 5px;display:inline-block}
+.sheet button{margin-top:6px;width:100%;padding:11px;background:var(--ink);color:#fff;
+  border:0;border-radius:2px;font-family:inherit;font-size:13px;font-weight:600;cursor:pointer}
+@media(prefers-reduced-motion:no-preference){.sheet.on .sheet-in{animation:up .2s ease}}
+@keyframes up{from{transform:translateY(14px)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="brand"><h1>DivDesk</h1><span>배당ETF 매수검토</span></div>
+  <div class="asof num">데이터 기준 2026-07-30 · USD/KRW 1,378.40 · 아래 숫자는 전부 더미</div>
+  <div class="seg" role="tablist">
+    <button role="tab" aria-selected="true">일반·미국상장</button>
+    <button role="tab" aria-selected="false">일반·국내상장</button>
+    <button role="tab" aria-selected="false">절세계좌</button>
+  </div>
+</header>
 
-@dataclass
-class Projection:
-    ticker: str
-    monthly_krw: float
-    years: int
-    windows: int                     # 몇 개의 시작 시점을 시험했는지
-    total_invested_krw: float
-    worst: Scenario | None = None
-    median: Scenario | None = None
-    best: Scenario | None = None
-    median_final_krw: float = 0.0
-    median_profit_krw: float = 0.0
-    median_return_pct: float = 0.0
-    median_annual_pct: float = 0.0
-    loss_windows: int = 0            # 원금을 밑돈 경우의 수
-    data_from: date | None = None
-    data_to: date | None = None
-    full_from: date | None = None      # 잘라내기 전 이 종목의 실제 시작일
-    full_years: float = 0.0            # 이 종목이 가진 전체 이력 연수
-    notes: list[str] = field(default_factory=list)
+<!-- 계산기 -->
+<section class="page on" id="p1">
+  <div class="card">
+    <h2>계산 방향 <button class="info" onclick="sheet('dir')">i</button></h2>
+    <div class="dir">
+      <button aria-selected="true">금액 → 월배당</button>
+      <button aria-selected="false">월배당 → 필요금액</button>
+    </div>
+    <label>투자 원금</label>
+    <div class="field"><input value="50,000,000" inputmode="numeric"><em>원</em></div>
 
+    <div class="result">
+      <div class="lbl">세후 월평균 배당 <button class="info" onclick="sheet('avg')">i</button></div>
+      <div class="big">168,420원</div>
+      <div class="rows">
+        <div class="row"><span>연 세전 배당</span><b class="num">2,384,000원</b></div>
+        <div class="row"><span>미국 원천징수 15%</span><b class="num minus">-357,600원</b></div>
+        <div class="row"><span>국내 추가납부</span><b class="num">0원</b></div>
+        <div class="row"><span>가중 배당률</span><b class="num">4.77%</b></div>
+      </div>
+    </div>
+  </div>
 
-def _month_key(day: date) -> tuple:
-    return (day.year, day.month)
+  <div class="card">
+    <h2>월별 실제 입금 <button class="info" onclick="sheet('strip')">i</button></h2>
+    <div class="strip">
+      <div class="mo"><div class="bar" style="height:22%"></div><b>1</b></div>
+      <div class="mo"><div class="bar" style="height:24%"></div><b>2</b></div>
+      <div class="mo"><div class="bar" style="height:88%"></div><b>3</b></div>
+      <div class="mo"><div class="bar" style="height:23%"></div><b>4</b></div>
+      <div class="mo"><div class="bar" style="height:25%"></div><b>5</b></div>
+      <div class="mo"><div class="bar est" style="height:91%"></div><b>6</b></div>
+      <div class="mo"><div class="bar est" style="height:24%"></div><b>7</b></div>
+      <div class="mo"><div class="bar est" style="height:23%"></div><b>8</b></div>
+      <div class="mo"><div class="bar est" style="height:95%"></div><b>9</b></div>
+      <div class="mo"><div class="bar est" style="height:25%"></div><b>10</b></div>
+      <div class="mo"><div class="bar est" style="height:24%"></div><b>11</b></div>
+      <div class="mo"><div class="bar est" style="height:98%"></div><b>12</b></div>
+    </div>
+    <div class="legend">
+      <span><i style="background:#0E6F63"></i>확정</span>
+      <span><i class="bar est" style="height:9px"></i>추정</span>
+      <span>분기배당 종목 때문에 3·6·9·12월에 몰립니다</span>
+    </div>
+  </div>
+</section>
 
+<!-- 타점 -->
+<section class="page" id="p2">
+  <div class="card">
+    <h2>오늘의 매수타점 <button class="info" onclick="sheet('score')">i</button></h2>
+    <div class="etf">
+      <div class="score s-buy"><b>88</b><s>적극매수</s></div>
+      <div class="etf-main">
+        <div class="tk">SCHD<small>배당성장·분기</small></div>
+        <div class="why">배당률 5년 상위 11% · 200일선 -6.3% · 배당락 D-42</div>
+      </div>
+      <div class="yld"><b>4.21%</b><s>배당률</s></div>
+    </div>
+    <div class="etf">
+      <div class="score s-buy"><b>79</b><s>매수</s></div>
+      <div class="etf-main">
+        <div class="tk">TIGER 미국배당다우존스<small>월배당</small></div>
+        <div class="why">환율 3년 상위 78%로 감점 · 분배금 12개월 +6.4%</div>
+      </div>
+      <div class="yld"><b>3.98%</b><s>배당률</s></div>
+    </div>
+    <div class="etf">
+      <div class="score s-hold"><b>61</b><s>관망</s></div>
+      <div class="etf-main">
+        <div class="tk">JEPQ<small>커버드콜·월배당</small></div>
+        <div class="why">분배율 10.8%인데 1년 총수익 +1.2% · 배당락 D-3</div>
+        <div class="badge">분배금 ≠ 수익</div>
+      </div>
+      <div class="yld"><b>10.84%</b><s>배당률</s></div>
+    </div>
+    <div class="etf">
+      <div class="score s-wait"><b>44</b><s>보류</s></div>
+      <div class="etf-main">
+        <div class="tk">QYLD<small>커버드콜·월배당</small></div>
+        <div class="why">분배금 3년 -18% · 원금환급 성향 · 52주 상단 92%</div>
+        <div class="badge">분배금 ≠ 수익</div>
+      </div>
+      <div class="yld"><b>11.92%</b><s>배당률</s></div>
+    </div>
+  </div>
+</section>
 
-def _monthly_points(series: list) -> list:
-    """(날짜, 수정종가) 시계열에서 매달 첫 거래일만 추린다."""
-    seen: set = set()
-    out = []
-    for day, adj in sorted(series):
-        if adj is None or adj <= 0:
-            continue
-        key = _month_key(day)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((day, float(adj)))
-    return out
+<!-- 매수기록 -->
+<section class="page" id="p3">
+  <div class="card">
+    <h2>매수기록</h2>
+    <table>
+      <tr><th>일자</th><th>종목</th><th style="text-align:right">수량</th><th style="text-align:right">단가</th><th style="text-align:right">평가</th></tr>
+      <tr><td class="num">07-24</td><td>SCHD</td><td class="n">120</td><td class="n">$28.40</td><td class="n" style="color:#0E6F63">+3.1%</td></tr>
+      <tr><td class="num">07-02</td><td>JEPI</td><td class="n">60</td><td class="n">$57.10</td><td class="n" style="color:#A63A18">-1.4%</td></tr>
+      <tr><td class="num">06-18</td><td>TIGER 미국배당다우존스</td><td class="n">400</td><td class="n">11,905원</td><td class="n" style="color:#0E6F63">+2.2%</td></tr>
+    </table>
+    <div class="warn">
+      <b>금융소득 워치독</b><br>
+      올해 누적 세전 금융소득 <span class="num">7,412,000원</span> / 2,000만원 기준 37%.
+      1,600만원 도달 시 절세계좌 이전을 제안합니다.
+    </div>
+  </div>
+</section>
+</div>
 
+<nav role="tablist">
+  <button role="tab" aria-selected="true" onclick="go(1,this)">계산</button>
+  <button role="tab" aria-selected="false" onclick="go(2,this)">타점</button>
+  <button role="tab" aria-selected="false" onclick="go(3,this)">기록</button>
+</nav>
 
-def common_start(series_map: dict) -> date | None:
-    """여러 종목을 비교할 때 공통으로 존재하는 가장 이른 시점.
+<div class="sheet" id="sh" onclick="if(event.target===this)close_()">
+  <div class="sheet-in">
+    <h3 id="sh-t"></h3>
+    <div id="sh-b"></div>
+    <button onclick="close_()">닫기</button>
+  </div>
+</div>
 
-    이걸 안 맞추면 비교가 거짓말이 된다. QQQ는 1999년부터, SCHD는 2011년부터라
-    각자의 전체 이력으로 돌리면 QQQ에만 닷컴버블이 들어가 최악값이 훨씬 나쁘게 나온다.
-    상품이 위험해서가 아니라 겪은 시대가 달라서 생긴 차이다.
-    """
-    starts = []
-    for series in series_map.values():
-        points = _monthly_points(series)
-        if points:
-            starts.append(points[0][0])
-    return max(starts) if starts else None
-
-
-def simulate(ticker: str, series: list, monthly_krw: float, years: int,
-             step_months: int = 1, since: date | None = None) -> Projection:
-    """series: [(date, adj_close), ...]  — 수정종가여야 총수익 기준이 된다.
-
-    since 를 주면 그 시점 이후만 쓴다. 여러 종목을 같은 기간으로 비교할 때 필요하다.
-    """
-    if monthly_krw <= 0:
-        raise ValueError("월 적립액은 0보다 커야 합니다")
-    if years <= 0:
-        raise ValueError("기간은 1년 이상이어야 합니다")
-
-    need = years * 12
-    result = Projection(ticker=ticker, monthly_krw=monthly_krw, years=years,
-                        windows=0, total_invested_krw=monthly_krw * need)
-
-    all_points = _monthly_points(series)
-    if all_points:
-        result.full_from = all_points[0][0]
-        result.full_years = round(
-            (all_points[-1][0] - all_points[0][0]).days / 365.25, 1)
-    points = all_points
-    if since:
-        points = [p for p in points if p[0] >= since]
-    if len(points) < need + 1:
-        have = len(points) / 12
-        result.notes.append(
-            f"{years}년 시뮬레이션에는 {need + 1}개월치 시세가 필요한데 "
-            f"{len(points)}개월치({have:.1f}년)뿐입니다. "
-            f"기간을 {max(1, int(have) - 1)}년 이하로 줄이거나 이력을 더 수집하세요.")
-        return result
-
-    result.data_from, result.data_to = points[0][0], points[-1][0]
-
-    scenarios: list[Scenario] = []
-    for offset in range(0, len(points) - need, step_months):
-        window = points[offset:offset + need + 1]
-        shares = 0.0
-        for _, price in window[:need]:
-            shares += monthly_krw / price
-        final = shares * window[need][1]
-        scenarios.append(Scenario(start=window[0][0], end=window[need][0],
-                                  invested=monthly_krw * need, final_value=final))
-
-    if not scenarios:
-        result.notes.append("시뮬레이션할 구간이 없습니다.")
-        return result
-
-    ordered = sorted(scenarios, key=lambda s: s.final_value)
-    mid = ordered[len(ordered) // 2]
-    result.windows = len(ordered)
-    result.worst, result.median, result.best = ordered[0], mid, ordered[-1]
-    result.median_final_krw = round(mid.final_value)
-    result.median_profit_krw = round(mid.profit)
-    result.median_return_pct = round(mid.return_pct, 1)
-    result.median_annual_pct = round(mid.annualized_pct, 2)
-    result.loss_windows = sum(1 for s in ordered if s.profit < 0)
-
-    span = (points[-1][0] - points[0][0]).days / 365.25
-    result.notes.append(
-        f"과거 {span:.0f}년 데이터에서 시작 시점을 {len(ordered)}가지로 바꿔 계산한 결과입니다. "
-        "과거 성과가 미래를 보장하지 않습니다.")
-    if result.loss_windows:
-        result.notes.append(
-            f"{len(ordered)}번 중 {result.loss_windows}번은 {years}년을 채우고도 "
-            "원금을 밑돌았습니다.")
-    if span < years * 2:
-        result.notes.append(
-            "데이터 기간이 짧아 시험한 시작 시점이 몇 개 없습니다. "
-            "특정 시기의 시장 상황에 결과가 크게 좌우됩니다.")
-    return result
-
-
-def compare(projections: list) -> dict:
-    """여러 종목을 같은 조건으로 비교한다. 벤치마크가 섞여 있으면 기준으로 삼는다."""
-    valid = [p for p in projections if p.windows > 0]
-    if not valid:
-        return {"items": [], "notes": ["비교할 수 있는 종목이 없습니다."]}
-    ranked = sorted(valid, key=lambda p: -p.median_final_krw)
-    return {
-        "items": ranked,
-        "best": ranked[0].ticker,
-        "worst": ranked[-1].ticker,
-        "spread_krw": round(ranked[0].median_final_krw - ranked[-1].median_final_krw),
-    }
-
-
-def growth_quality(series: list, years: int = 5) -> dict:
-    """가격이 꾸준히 올랐는지 평가한다.
-
-    배당만 보고 고르면 주가가 계속 빠지는 종목을 사게 된다. 분배금을 받아도
-    원금이 깎이면 손해다. 그래서 '꾸준한 상승'을 별도로 점수화한다.
-
-    보는 것:
-      - 연도별 총수익이 플러스인 해의 비율 (꾸준함)
-      - 최대 낙폭 (버틸 수 있는지)
-      - 전체 기간 연평균 총수익률
-    """
-    points = _monthly_points(series)
-    if len(points) < 24:
-        return {"available": False, "reason": "데이터가 2년 미만입니다"}
-
-    window = points[-(years * 12 + 1):] if len(points) > years * 12 else points
-    start_val, end_val = window[0][1], window[-1][1]
-    span_years = (window[-1][0] - window[0][0]).days / 365.25
-    cagr = ((end_val / start_val) ** (1 / span_years) - 1) * 100 if span_years > 0 else 0.0
-
-    # 12개월 단위 구간 수익률
-    yearly = []
-    for i in range(0, len(window) - 12, 12):
-        a, b = window[i][1], window[i + 12][1]
-        if a > 0:
-            yearly.append((b / a - 1) * 100)
-    positive = sum(1 for y in yearly if y > 0)
-
-    peak, mdd = window[0][1], 0.0
-    for _, value in window:
-        peak = max(peak, value)
-        mdd = min(mdd, (value / peak - 1) * 100)
-
-    consistency = (positive / len(yearly)) if yearly else None
-    return {
-        "available": True,
-        "cagr_pct": round(cagr, 2),
-        "years": round(span_years, 1),
-        "up_years": positive,
-        "total_years": len(yearly),
-        "consistency": round(consistency, 2) if consistency is not None else None,
-        "mdd_pct": round(mdd, 1),
-        "volatility_pct": round(statistics.pstdev(yearly), 1) if len(yearly) > 1 else None,
-    }
+<script>
+const DOC={
+ dir:["계산 방향","<p>두 방향 모두 같은 세금 규칙을 씁니다.</p><p><b>금액 → 월배당</b>: 원금을 넣으면 세후 월평균과 월별 입금 편차를 보여줍니다.</p><p><b>월배당 → 필요금액</b>: 목표 월배당을 넣으면 필요 원금과 종목별 주수를 역산합니다. 주수는 정수로 내림한 뒤 부족분을 다시 채웁니다.</p>"],
+ avg:["세후 월평균 배당은 어떻게 나오나요","<p><code>연 세전배당 ÷ 12 × (1 - 실효세율) × 환율</code></p><p>연 세전배당은 종목별 최근 4회 분배금 합계를 보유 주수에 곱해 더한 값입니다. 예상치가 아니라 이미 지급된 금액 기준입니다.</p><p>미국 상장 ETF는 현지에서 15%를 먼저 떼고, 한국 배당소득세율(14%)보다 높아 통상 추가 납부가 없습니다. 연 금융소득이 2,000만원을 넘으면 종합과세로 넘어가 계산이 달라집니다.</p>"],
+ strip:["월별 입금이 왜 들쭉날쭉한가요","<p>분기배당 종목은 3·6·9·12월에만 입금됩니다. 그래서 '월평균'과 '이번 달 실제 입금'은 다릅니다.</p><p>빗금 막대는 아직 공시되지 않은 추정치입니다. 최근 4회 평균에 성장 추세를 반영해 계산하며, 운용사 배당 공시가 나오면 확정으로 바뀝니다.</p>"],
+ score:["타점 점수 계산식","<p>두 축입니다. <b>품질은 이 상품이 꾸준한가, 타점은 지금 얼마나 싸게 사는가.</b></p><p><code>배당률 30 · 가격 위치 20 · 분배금 성장 15 · 위험조정 수익 15 · 환율 10 · 배당락 회복력 10</code></p><p>종합은 <b>품질 75% + 타점 25%</b>. 85 이상 적극매수, 70~84 매수, 55~69 분할·관망, 55 미만 보류. 품질이 50점 미만이면 아무리 싸도 제외합니다.</p><p><b>타점 비중이 낮은 이유</b> — 과거 10년으로 검증해 보니 가격으로 매수 시점을 맞히는 힘이 거의 없었습니다. 방향이 맞은 건 고점 대비 낙폭 하나뿐이라, 200일선 추세와 골든크로스는 점수에서 빼고 경고로만 남겼습니다.</p><p><b>가격 위치</b>는 고점 대비 낙폭을 그 종목 자기 이력과 함께 봅니다. 같은 -10%도 평소 -50%씩 빠지던 종목엔 평범하고, -14%가 최대였던 종목엔 역대급이기 때문입니다.</p><p>배당률이 높다고 점수가 오르는 게 아니라, <b>그 종목의 과거 자기 배당률 대비 지금이 싼지</b>를 봅니다. 커버드콜 종목은 분배금 일부가 옵션 프리미엄과 원금환급이라 총수익 항목에서 감점될 수 있습니다.</p>"]
+};
+function sheet(k){document.getElementById('sh-t').textContent=DOC[k][0];
+ document.getElementById('sh-b').innerHTML=DOC[k][1];document.getElementById('sh').classList.add('on')}
+function close_(){document.getElementById('sh').classList.remove('on')}
+function go(n,b){document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
+ document.getElementById('p'+n).classList.add('on');
+ document.querySelectorAll('nav button').forEach(x=>x.setAttribute('aria-selected','false'));
+ b.setAttribute('aria-selected','true');window.scrollTo(0,0)}
+document.querySelectorAll('.seg button,.dir button').forEach(b=>b.onclick=()=>{
+ b.parentNode.querySelectorAll('button').forEach(x=>x.setAttribute('aria-selected','false'));
+ b.setAttribute('aria-selected','true')});
+addEventListener('keydown',e=>{if(e.key==='Escape')close_()});
+</script>
+</body>
+</html>

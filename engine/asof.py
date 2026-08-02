@@ -1,332 +1,140 @@
-"""과거 임의 시점(as-of) 기준 스코어 입력 조립 — 백테스트·프로덕션 공용.
+# 품질확인서 — 타점 재설계
 
-왜 필요한가: `api.main.recompute()` 는 "지금" 을 전제로 DB에서 값을 뽑아
-ScoreInput 을 만든다(ORDER BY date DESC LIMIT ...). 백테스트는 같은 조립을
-**과거 시점 D 기준으로** 재현해야 한다. 두 벌로 만들면 "프로덕션과 다른
-채점기를 검증" 하는 셈이 되므로, 조립을 여기 한 곳으로 모으고 recompute() 도
-이 함수를 쓰게 한다.
+작성일 2026-08-02 · 근거: `docs/QUALITY-백테스트.md`
+변경 파일: `engine/score.py`, `engine/asof.py`, `api/main.py`,
+`scripts/verify.py`, `web/src/api.jsx`, `web/src/App.jsx`,
+`docs/divdesk-mockup.html`
 
-핵심 원칙(= look-ahead 차단):
- - 지표는 저장값(ma200 컬럼)을 읽지 않고 **종가 시계열에서 D까지의 창으로
-   다시 계산**한다. 저장 ma200 은 서버에 마지막 날짜치만 있어 과거 재구성이
-   불가능하고, 애초에 매일 backfill 되지 않았다. 종가에서 후향 창으로 내면
-   D 시점에 알 수 있던 값과 정확히 같다.
- - 모든 배당·환율·수익 창은 D 로 끝난다. 수정종가(adj_close)는 최신 시점으로
-   재보정되지만, D 로 끝나는 창 안의 **비율**만 쓰면 사후 배당보정이 양 끝을
-   같은 배수로 스케일해 상쇄되므로 안전하다. 절대 레벨은 쓰지 않는다.
+---
 
-store.py / recompute() 의 창 정의를 그대로 미러링한다:
- - ma200  = 최근 200 거래일 종가 단순평균 (store.py: daily[i-199:i+1] 평균)
- - 52주   = 최근 252 거래일 종가 max/min
- - slope  = ma200(D) 대비 ma200(D-60일) 변화율
- - 20일   = 최근 21행 중 첫 행 대비 변화율
- - 위험   = 최근 3년 수정종가
-"""
-from __future__ import annotations
+## 1. 무엇을 왜 바꿨나
 
-from bisect import bisect_right
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import date, timedelta
+백테스트에서 타점(매수 시점) 점수가 이후 수익을 예측하지 못한다는 것이
+확인됐다. 원인은 신호가 없어서가 아니라 **성격이 반대인 신호를 한 점수에
+겹쳐 놓았기 때문**이었다. 추세추종(기울기 8점)과 역추세(낙폭 6점)가 서로를
+상쇄했고, 부호가 틀린 쪽에 가중치가 더 컸다.
 
-WIN52 = 252                  # 52주 창(거래일)
-MIN_DD_HISTORY = 252         # 낙폭 백분위를 내려면 최소 이 만큼의 낙폭 이력이 필요
+축의 정의를 다시 세웠다.
 
-from .dividend import compute as compute_dividend
-from .dividend import describe as describe_dividend
-from .exdrop import ExDropSample, ExDropStat, compute_sample, summarize
-from .exdrop import RECOVERY_LIMIT
-from .risk import compute as compute_risk
-from .risk import describe as describe_risk
-from .score import ScoreInput, ScoreResult, score
+> **품질 = 안정성** (이 상품이 꾸준한가)
+> **타점 = 얼마나 싸게 사는가** (지금 싼가)
 
+이 정의로 보면 기울기(추세 방향)와 20일 과열(모멘텀)은 애초에 다른 축의
+신호였다. 그래서 타점에서 빠지는 것이 실증적으로도 개념적으로도 맞다.
 
-@dataclass
-class TickerSeries:
-    """한 종목의 일별 시계열. 날짜 오름차순 정렬된 병렬 배열."""
-    dates: list          # list[date]
-    close: list          # list[float]
-    adj: list            # list[float | None]
-    open: list           # list[float | None]
-    low: list            # list[float | None]
+## 2. 요구사항 대조표
 
+| # | 요구사항 | 결과 | 근거 |
+|---|---|---|---|
+| 1 | 검증에서 방향이 틀린 항목 제거 | 충족 | 200일선 기울기·20일 과열을 점수에서 제외 |
+| 2 | 제거하되 뒤집지 않기 | 충족 | 최근 기간 상관이 0 이라 반대편 배점 근거 없음. 경고는 유지 |
+| 3 | 원래 의도(하락 추세 주의) 보존 | 충족 | 하락추세·단기과열 경고 문구 유지, 검증 항목으로 고정 |
+| 4 | 낙폭을 자기 기준으로 정규화 | 충족 | `dd_pctile` 신설, `min(절대, 자기이력)` 적용 |
+| 5 | 골든크로스 3요소 반영 검토 | **검증 후 제외** | 5절 |
+| 6 | 고점 대비 % 표시 | 충족 | "가격 위치" 값에 `고점 대비 -8.2%` 노출, 부연에 이력 위치 |
+| 7 | 타점 비중 축소 | 충족 | 품질:타점 60:40 → **75:25** |
+| 8 | 화면 문구 동기화 (CLAUDE.md 7) | 충족 | `api.jsx`·`App.jsx`·목업 갱신 |
 
-@dataclass
-class Panel:
-    """모든 종목의 원본 시계열 + 환율 + 메타. 백테스트·프로덕션 공용 입력.
+## 3. 변경 내용
 
-    provider 가 이 Panel 을 채워 넘기면, build_input/score_asof 는 DB 든 CSV 든
-    출처를 모른 채 과거 임의 시점을 채점한다.
-    """
-    px: dict = field(default_factory=dict)       # ticker -> TickerSeries
-    divs: dict = field(default_factory=dict)     # ticker -> list[(ex_date, dps)] asc
-    fx_dates: list = field(default_factory=list)  # list[date] asc
-    fx_vals: list = field(default_factory=list)   # list[float] asc
-    meta: dict = field(default_factory=dict)     # ticker -> dict
+**가격 위치 20점** — 낙폭 하나만 본다.
 
+```
+점수 = 20 × min( 절대기준, 자기이력기준 )
+  절대기준    clip(-낙폭 / 0.10)      -10% 면 만점
+  자기이력기준  과거 낙폭 분포에서의 위치   역대 최악이면 1.0
+```
 
-def bench_ticker(ticker: str, meta: dict) -> str:
-    """이 종목의 시장 기준(기초자산 국적). api.main.market_ticker 와 동일 규칙.
+둘 중 **낮은 쪽**을 쓴다. 절대 기준만 보면 -10% 상한에 자주 포화돼
+(짧은 이력 관측의 33%가 만점) 변별력을 잃고, 자기 이력만 보면 아직 위기를
+겪지 않은 종목이 평범한 조정에 만점을 받는다. 서로의 실패를 막는 구조다.
+자기 이력이 1년 미만이면 `dd_pctile=None` 으로 절대 기준만 적용한다.
 
-    자기 자신을 기준으로 보정하면 배당 효과까지 상쇄되므로 벤치마크는 자기 자신.
-    """
-    if ticker in ("SPY", "VOO", "QQQ", "069500"):
-        return ticker
-    idx = (meta.get("index") or "").upper()
-    if meta.get("market") == "US":
-        return "SPY"
-    if any(k in idx for k in ("DOW JONES", "S&P", "NASDAQ", "U.S.", "US ")):
-        return "SPY"
-    return "069500"
+**종합 = 품질 × 0.75 + 타점 × 0.25** (기존 0.6 / 0.4)
 
+**신뢰도 분모** 8 → 6. 200일선 추세·20일 변동이 점수에서 빠져 중립 처리
+대상이 아니게 됐다.
 
-def _mean(values: list) -> float | None:
-    return sum(values) / len(values) if values else None
+**표기 — 백분율이 아니라 순위.** 처음에는 `dd_pctile` 을 그대로 "상위 85%"
+로 찍었는데 이는 정반대로 읽히는 오류였다(0.85 는 과거의 85% 보다 더 빠졌다는
+뜻이므로 심한 쪽이다). 뒤집어 "상위 15%" 로 고쳤으나, 상위·하위 표기 자체가
+방향을 즉시 읽히게 하지 못한다는 판단으로 **순위 표기**로 바꿨다.
 
+```
+고점 대비 -8.0%   과거 낙폭 100건 중 15번째로 큼    16.0점
+고점 대비 -3.0%   과거 낙폭 100건 중 85번째로 큼     3.0점
+고점 대비 -35.0%  과거 낙폭 100건 중 1번째로 큼     20.0점
+```
 
-def _ma_at(ts: TickerSeries, upto_idx: int, window: int = 200) -> float | None:
-    """upto_idx(=D 이하 종가 개수) 기준 최근 window 종가 단순평균."""
-    if upto_idx < window:
-        return None
-    return _mean(ts.close[upto_idx - window:upto_idx])
+1번째가 역대 최악이다. 별도 예외 문구 없이 한 가지 방식으로 통일했다.
 
+## 4. 검증 4단계 결과
 
-def _dd_history(close: list, upto: int) -> list:
-    """0..upto-1 구간의 일자별 52주 고점 대비 낙폭. 미성립 구간은 뺀다.
+`make verify` 전 단계 통과 (문법 / import / 목 실행 / pyflakes 지적 0건).
+프론트는 `node check.cjs` — 컴포넌트 참조 검사 통과.
 
-    dd[k] = close[k] / max(close[k-251:k+1]) - 1   (0 이하)
-    단조 덱으로 슬라이딩 최대값을 O(n) 에 낸다. upto 를 넘겨 보지 않으므로
-    as_of 이후 데이터가 섞이지 않는다(look-ahead 차단).
-    """
-    out: list = []
-    dq: deque = deque()                      # 값 내림차순 인덱스
-    for k in range(upto):
-        v = close[k]
-        while dq and close[dq[-1]] <= v:
-            dq.pop()
-        dq.append(k)
-        while dq[0] <= k - WIN52:
-            dq.popleft()
-        if k >= WIN52 - 1:
-            hi = close[dq[0]]
-            if hi > 0:
-                out.append(v / hi - 1)
-    return out
+목 실행에 새로 넣은 검사(기존 검사는 설계가 바뀌어 교체했다):
 
+- 낙폭이 클수록 고득점 (단조)
+- 기울기·20일 변동은 점수에 **영향 없음** (같은 낙폭이면 동점)
+- 이력상 평범하면 절대 만점이어도 깎임 / 이력 없으면 절대 기준만
+- 고점 대비 %를 값으로 노출, 이력 위치를 부연에 노출
+- **순위 표기 검사** — 0.85 → "100건 중 15번째", 0.15 → "85번째",
+  1.0 → "1번째". 상위·하위 표기를 쓰지 않는지도 함께 검사
+- 하락추세·단기과열 경고는 그대로 발생
+- 종합 = 품질 75 : 타점 25
 
-def _dd_pctile(close: list, upto: int) -> float | None:
-    """지금 낙폭이 과거 낙폭 분포에서 어느 위치인가. 1.0 이면 역대 최악.
+`scripts/test_asof.py` 의 look-ahead 검사도 재실행해 통과. `dd_pctile` 은
+`as_of` 이하 종가만으로 계산되며, 미래를 잘라낸 패널과 결과가 일치한다.
 
-    이력이 짧으면 None — 아직 위기를 겪지 않은 종목이 평범한 조정에 만점을
-    받는 것을 막는다. 그 경우 score() 가 절대 기준만으로 물러선다.
-    """
-    hist = _dd_history(close, upto)
-    if len(hist) < MIN_DD_HISTORY:
-        return None
-    cur = hist[-1]
-    return sum(1 for d in hist if d > cur) / len(hist)
+## 5. 골든크로스를 넣지 않은 이유
 
+요청대로 검증했고(`scripts/bt_gc.py`), 결과가 제외를 가리켰다.
 
-def _risk_prices(ts: TickerSeries, as_of: date, i: int, years: int = 3) -> list:
-    """최근 years 년 수정종가(None 제외). i = D 이하 행 개수."""
-    cut = as_of - timedelta(days=365 * years)
-    start = bisect_right(ts.dates, cut)
-    return [a for a in ts.adj[start:i] if a is not None]
+| 신호 | 상관 | 동일종목차 | 양(+) |
+|---|---|---|---|
+| GC 상태 | -0.228 | -3.3% | 8/23 |
+| GC 이격 | -0.239 | -8.8% | **0/23** |
+| GC 최근돌파 | -0.002 | +1.0% | 9/23 |
+| 낙폭(D최소) | +0.342 | +12.7% | 22/23 |
 
+핵심은 조합이었다. **싼 구간에서 골든크로스가 있는 쪽이 +12.5%, 없는 쪽이
++16.1% (차 -3.6%p).** 반등을 확인하고 사면 이미 늦었다. 조합 점수도
+낙폭 단독 +0.342 → 낙폭×GC가점 +0.307 로 떨어졌고, GC 유무와 무관하게
+낙폭 상관은 +0.269 / +0.264 로 같아 추가 정보가 없었다.
 
-def _exdrop_at(panel: Panel, ticker: str, ts: TickerSeries, i: int,
-               as_of: date, limit: int = 16) -> ExDropStat:
-    """배당락 지표. open 이 없으면 drop_ratio 가 안 나와 자동으로 중립 처리된다.
+GC 이격의 0/23 은 200일선 기울기와 같은 수치다 — 이름만 다를 뿐 둘 다
+"지금 상승 추세인가" 를 재고 있었다. 새로웠던 '전환 직후' 만 부호가 반대는
+아니었으나 상관 -0.002 로 점수화할 근거가 없었다.
 
-    시장 보정은 기초자산 벤치마크의 D 이하 종가 변동으로 한다.
-    """
-    meta = panel.meta.get(ticker, {})
-    bench = bench_ticker(ticker, meta)
-    moves: dict = {}
-    if bench != ticker and bench in panel.px:
-        bts = panel.px[bench]
-        bj = bisect_right(bts.dates, as_of)
-        prev = None
-        for k in range(bj):
-            c = bts.close[k]
-            if prev:
-                moves[bts.dates[k]] = (c - prev) / prev
-            prev = c
+## 6. 배포 영향 — 점수가 바뀐다
 
-    index = {ts.dates[k]: k for k in range(i)}
-    divs = [(exd, dps) for (exd, dps) in panel.divs.get(ticker, []) if exd <= as_of]
-    samples = []
-    for exd, dps in list(reversed(divs))[:limit]:
-        pos = index.get(exd)
-        if not pos:                       # 배당락 당일 시세 없음(또는 pos==0)
-            continue
-        before = ts.close[pos - 1]
-        sample = ExDropSample(
-            ex_date=exd, dps=float(dps), before_close=float(before),
-            open_px=ts.open[pos], close_px=ts.close[pos], low_px=ts.low[pos],
-            market_change=moves.get(exd))
-        fwd = [(ts.dates[k], ts.close[k]) for k in range(pos, min(pos + RECOVERY_LIMIT, i))]
-        samples.append(compute_sample(sample, fwd))
-    return summarize(samples)
+이 변경은 **모든 종목의 점수를 바꾼다.** 배포 후 `/scores/recompute` 를
+돌려야 화면에 반영된다. 예상되는 방향:
 
+- 상승 추세 종목의 타점이 **내려간다** (기울기 8점 가점이 사라짐)
+- 하락 추세 종목의 타점이 **올라간다** (기울기 감점이 사라짐) —
+  다만 품질 하한(50점 미만 제외)은 그대로라 부실 종목이 매수 후보로
+  올라오지는 않는다
+- 종합 점수의 종목 간 차이가 **줄어든다** (타점 비중 40%→25%)
+- 데이터 신뢰도가 전반적으로 **올라간다** (분모 8→6)
 
-def build_input(panel: Panel, ticker: str, as_of: date) -> ScoreInput | None:
-    """D(as_of) 시점에 알 수 있던 데이터만으로 ScoreInput 을 만든다.
+`api/main.py` 의 `recompute()` 를 `engine.asof` 경로로 전환한 것도 함께
+반영된다. 이는 백테스트와 프로덕션이 같은 채점기를 쓰게 하려는 것이며,
+부수적으로 **저장 `ma200` 이 하루치뿐이라 200일선 기울기가 상시 중립이던
+문제**도 해소된다(다만 그 항목은 이제 점수에 쓰이지 않는다).
 
-    데이터가 부족하면(가격 없음 / 배당 1년 미만) None 을 돌려 그 시점은 건너뛴다.
-    recompute() 의 스킵 조건(px 없음 or len(dv) < pays)과 같다.
-    """
-    ts = panel.px.get(ticker)
-    if ts is None:
-        return None
-    meta = panel.meta.get(ticker, {})
-    pays = int(meta.get("pays_per_year") or 4)
+## 7. 미충족·한계
 
-    i = bisect_right(ts.dates, as_of)       # D 이하 종가 행 개수
-    if i == 0:
-        return None
-    price = ts.close[i - 1]
-    if not price or price <= 0:
-        return None
-
-    # ── 배당 (≤ D, 최신순) ──────────────────────────
-    div_upto = [(exd, dps) for (exd, dps) in panel.divs.get(ticker, []) if exd <= as_of]
-    amounts = [float(dps) for _, dps in reversed(div_upto)][:pays * 8]
-    if len(amounts) < pays:
-        return None                         # 1년치 미만이면 채점 불가(recompute 와 동일)
-    ttm = sum(amounts[:pays])
-    prev = sum(amounts[pays:pays * 2]) if len(amounts) >= pays * 2 else None
-    yield_hist = [sum(amounts[j:j + pays]) / price * 100
-                  for j in range(0, max(0, len(amounts) - pays))]
-    dividend = compute_dividend(amounts, pays)
-    dps_label, dps_sub = describe_dividend(dividend)
-
-    # ── 가격 지표 (종가에서 재계산) ─────────────────
-    ma_now = _ma_at(ts, i, 200)
-    past_cut = as_of - timedelta(days=60)
-    j = bisect_right(ts.dates, past_cut)
-    ma_past = _ma_at(ts, j, 200)
-    ma200_slope = None
-    if ma_now and ma_past and ma_past > 0:
-        ma200_slope = round((ma_now - ma_past) / ma_past, 4)
-
-    high52 = max(ts.close[i - WIN52:i]) if i >= WIN52 else None
-    low52 = min(ts.close[i - WIN52:i]) if i >= WIN52 else None
-    drawdown = round(price / high52 - 1, 4) if high52 and high52 > 0 else None
-    # 절대 낙폭만으로는 종목별 변동성 차이를 보정하지 못한다. 자기 이력에서의
-    # 위치를 함께 넘겨 score() 가 둘 중 낮은 쪽을 쓰게 한다.
-    dd_pctile = _dd_pctile(ts.close, i) if drawdown is not None else None
-
-    change_20d = None
-    if i >= 21 and ts.close[i - 21] > 0:
-        change_20d = round((price - ts.close[i - 21]) / ts.close[i - 21], 4)
-
-    # ── 1년 총수익 (수정종가 비율, 없으면 근사) ─────
-    total_ret = None
-    year_cut = as_of - timedelta(days=365)
-    k = bisect_right(ts.dates, year_cut)
-    now_adj = next((a for a in reversed(ts.adj[:i]) if a is not None), None)
-    if k > 0:
-        base_adj = ts.adj[k - 1]
-        base_close = ts.close[k - 1]
-        if base_adj and now_adj and float(base_adj) > 0:
-            total_ret = round((float(now_adj) / float(base_adj) - 1) * 100, 2)
-        elif base_close and base_close > 0:
-            total_ret = round((price - base_close + ttm) / base_close * 100, 2)
-
-    # ── 위험조정 수익 (최근 3년 수정종가) ──────────
-    bench = bench_ticker(ticker, meta)
-    bench_cagr = None
-    if bench != ticker and bench in panel.px:
-        bstat = compute_risk(_risk_prices(panel.px[bench], as_of,
-                                          bisect_right(panel.px[bench].dates, as_of)))
-        bench_cagr = bstat.cagr if bstat.available else None
-    risk = compute_risk(_risk_prices(ts, as_of, i), bench_cagr)
-    if risk.available:
-        risk_label, risk_sub = describe_risk(risk, ttm / price * 100 if price else None)
-    else:
-        risk_label = (f"{total_ret:+.1f}%" if total_ret is not None else "데이터 없음")
-        risk_sub = (f"1년 총수익 (위험 지표 없음: {risk.reason})"
-                    if total_ret is not None else risk.reason)
-
-    # ── 환율 (≤ D) ─────────────────────────────────
-    f = bisect_right(panel.fx_dates, as_of)
-    fx_now = panel.fx_vals[f - 1] if f > 0 else None
-    fx_hist = panel.fx_vals[max(0, f - 780):f]
-
-    # ── 배당락 ─────────────────────────────────────
-    drop = _exdrop_at(panel, ticker, ts, i, as_of)
-
-    return ScoreInput(
-        ticker=ticker, price=price, ttm_dps=ttm, yield_history=yield_hist,
-        ma200=ma_now, high52=high52, low52=low52,
-        dps_ttm_prev=prev, total_return_1y_pct=total_ret,
-        fx_history=fx_hist, fx_now=fx_now,
-        dps_score=dividend.score if dividend.available else None,
-        dps_label=dps_label, dps_sub=dps_sub,
-        risk_score=risk.score if risk.available else None,
-        risk_label=risk_label, risk_sub=risk_sub,
-        fx_exposed=(bench != "069500"),
-        fx_hedged=bool(meta.get("fx_hedged")),
-        ma200_slope=ma200_slope, drawdown=drawdown, dd_pctile=dd_pctile,
-        days_to_ex=None,
-        exdrop_ratio=drop.drop_ratio, exdrop_samples=drop.samples,
-        exdrop_recovery=drop.open_recovery, exdrop_unrecovered=drop.unrecovered,
-        exdrop_gap=drop.intraday_gap, change_20d=change_20d,
-        is_covered_call=bool(meta.get("is_covered_call")),
-        is_krw_listed=meta.get("market") == "KR",
-    )
-
-
-def score_asof(panel: Panel, ticker: str, as_of: date) -> ScoreResult | None:
-    """D 시점 채점 결과. 데이터 부족이면 None."""
-    inp = build_input(panel, ticker, as_of)
-    if inp is None:
-        return None
-    return score(inp, today=as_of)
-
-
-def panel_from_rows(meta_rows, price_rows, div_rows, fx_rows) -> Panel:
-    """이미 조회된 행 리스트로 Panel 을 조립한다(출처 무관: DB rows / CSV).
-
-    프로덕션(api.main)과 백테스트가 각자 방식으로 행을 읽어와 이 함수로 넘기면
-    조립 로직이 한 곳에 모인다. 채점기(build_input)와 함께 '한 코드 경로'.
-
-    입력 형식:
-      meta_rows : dict(ticker, market, is_benchmark, is_covered_call,
-                       pays_per_year, index, fx_hedged)
-      price_rows: (ticker, date, close, adj_close, open, low)  # open/low 는 None 가능
-      div_rows  : (ticker, ex_date, dps)                       # is_estimate=false 만
-      fx_rows   : (date, usdkrw)                               # 날짜 오름차순
-    """
-    panel = Panel()
-    for m in meta_rows:
-        panel.meta[m["ticker"]] = {
-            "market": m.get("market"),
-            "is_benchmark": m.get("is_benchmark"),
-            "is_covered_call": m.get("is_covered_call"),
-            "pays_per_year": m.get("pays_per_year"),
-            "index": m.get("index"),
-            "fx_hedged": bool(m.get("fx_hedged")),
-        }
-
-    build: dict = {}
-    for t, d, close, adj, op, lo in price_rows:
-        acc = build.setdefault(t, ([], [], [], [], []))
-        acc[0].append(d)
-        acc[1].append(float(close))
-        acc[2].append(float(adj) if adj is not None else None)
-        acc[3].append(float(op) if op is not None else None)
-        acc[4].append(float(lo) if lo is not None else None)
-    for t, (dts, cl, aj, op, lo) in build.items():
-        panel.px[t] = TickerSeries(dates=dts, close=cl, adj=aj, open=op, low=lo)
-
-    for t, exd, dps in div_rows:
-        panel.divs.setdefault(t, []).append((exd, float(dps)))
-    for t in panel.divs:
-        panel.divs[t].sort()
-
-    fx_sorted = sorted(fx_rows)
-    panel.fx_dates = [d for d, _ in fx_sorted]
-    panel.fx_vals = [float(v) for _, v in fx_sorted]
-    return panel
+- **환율 10점은 검증되지 않은 채 남아 있다.** fx 이력이 2021-08 부터라
+  3년 밴드조차 실질 독립 관측이 두어 개다. 5년 밴드로 바꾸자는 안은
+  지지·반박 근거를 모두 찾지 못해 현행을 유지했다.
+- **낙폭 신호도 강도는 신뢰할 수 없다.** 2022년 이후 상관이 0 부근으로
+  무너진다(+0.035). 방향만 일관될 뿐이라 배점을 늘리지 않았다.
+- `open`·`low` 컬럼 부재로 **배당락 회복력 10점이 전 구간 중립**이다
+  (`QUALITY-백테스트.md` 결함 2). 이 항목은 품질 축이라 이번 변경 범위 밖.
+- 낙폭 백분위는 **일별 관측이라 자기상관이 크다.** "과거의 몇 %보다 더
+  빠졌나" 는 고점 부근에 머문 기간이 길수록 커진다. 의미는 유지되나
+  통계적 독립 표본으로 읽으면 안 된다.
+- `MIN_DD_HISTORY` 는 1년이다. 3년으로 올리는 안을 검토했으나, 국내 신규
+  상장 종목이 통째로 중립 처리되는 부작용이 있어 보류했다.
