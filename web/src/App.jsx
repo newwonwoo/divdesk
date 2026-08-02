@@ -458,10 +458,34 @@ function Screener({ onDoc }) {
             <div className={`score ${g.cls}`}><b>{e.total}</b><s>{g.text}</s></div>
             <div className="etf-main">
               <div className="tk">{shortLabel(e)}<small>{e.strategy}</small></div>
-              {e.facts?.length > 0
+              {quality != null && (
+                <div className="axes">
+                  <div className={`axis${excluded ? ' bad' : ''}`}>
+                    <span className="axis-l">상품 품질</span>
+                    <span className="bar-wrap wide">
+                      <span className="bar-fill" style={{ width: `${quality}%` }} />
+                    </span>
+                    <b>{quality}</b>
+                  </div>
+                  <div className="axis">
+                    <span className="axis-l">매수 타점</span>
+                    <span className="bar-wrap wide">
+                      <span className="bar-fill t" style={{ width: `${timing}%` }} />
+                    </span>
+                    <b>{timing}</b>
+                  </div>
+                  <div className="axis-note">
+                    품질 60% + 타점 40%
+                    {confidence != null && confidence < 80 && (
+                      <span className="low-conf"> · 데이터 신뢰도 {confidence}%</span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {facts.length > 0
                 ? <table className="facts">
                     <tbody>
-                      {e.facts.map(([k, v, sub, got, max], i) => (
+                      {facts.map(([k, v, sub, got, max], i) => (
                         <tr key={i}>
                           <th>{k}</th>
                           <td className="fv">{v}</td>

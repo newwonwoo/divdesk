@@ -41,7 +41,8 @@ def imports() -> bool:
             "collector.sources.stockanalysis", "collector.sources.naver_kr",
             "collector.store", "collector.run_us", "collector.run_kr", "collector.probe_kr",
             "collector.sync_toss", "collector.opening_balance",
-            "engine.tax", "engine.calc", "engine.score", "engine.calendar", "engine.returns", "engine.projection",
+            "db.migrate", "engine.tax", "engine.calc", "engine.score", "engine.calendar", "engine.returns", "engine.projection", "engine.exdrop",
+            "engine.risk", "engine.dividend",
             "alerts.push", "alerts.run_alerts", "api.main"]
     proc = subprocess.run(
         [sys.executable, "-c", "import " + ", ".join(mods) + "; print('  통과')"],
@@ -125,8 +126,34 @@ rich = sc(ScoreInput('T', 100, 2.0, yield_history=[5.0]*20, ma200=80, high52=101
 eq("싼 구간이 비싼 구간보다 고점", cheap.total > rich.total, True)
 eq("점수 0~100 범위", 0 <= cheap.total <= 100 and 0 <= rich.total <= 100, True)
 eq("커버드콜 배지 강제", sc(ScoreInput('C', 100, 12.0, is_covered_call=True)).warnings[0].startswith('분배금 ≠ 수익'), True)
+
+# 배당락 낙폭: 배당금보다 덜 떨어질수록 높은 점수여야 한다.
+# '며칠 남았나' 로 점수를 매기면 기다리기만 해도 점수가 오르는 지표가 된다.
+def exscore(ratio):
+    r = sc(ScoreInput('E', 100, 4.0, exdrop_ratio=ratio, exdrop_samples=12))
+    return [f for f in r.facts if f[0].startswith('배당락')][0][3]
+eq("낙폭 작을수록 고득점", exscore(0.6) > exscore(1.0) > exscore(1.4), True)
+eq("낙폭 0.5배 이하 만점", exscore(0.4), 10.0)
+eq("낙폭 1.5배 이상 0점", exscore(1.6), 0.0)
+eq("표본 3회 미만은 중립",
+   [f for f in sc(ScoreInput('E', 100, 4.0, exdrop_ratio=0.5, exdrop_samples=2)).facts
+    if f[0].startswith('배당락')][0][3], 5.0)
+eq("과다 낙폭은 경고",
+   any('배당을 노린 매물' in w
+       for w in sc(ScoreInput('E', 100, 4.0, exdrop_ratio=1.5, exdrop_samples=12)).warnings), True)
 eq("데이터 없으면 신뢰도 경고", any('신뢰도' in w for w in sc(ScoreInput('E', 100, 4.0)).warnings), True)
-eq("원화상장은 환율 항목 만점", sc(ScoreInput('K', 100, 4.0, is_krw_listed=True)).fx_pos, 10.0)
+# 원화 상장이어도 기초자산이 해외면 환율에 노출된다.
+# TIGER 미국배당다우존스는 원화로 사지만 환율이 오르면 가격이 오른다.
+_fxh = [1250 + i * 6 for i in range(30)]
+def fx_pt_of(**kw):
+    r = sc(ScoreInput('K', 100.0, 4.0, fx_history=_fxh, fx_now=1436.0, **kw))
+    return [f for f in r.facts if f[0] == '환율'][0][3]
+eq("기초자산 국내면 만점", fx_pt_of(is_krw_listed=True, fx_exposed=False), 10.0)
+eq("원화상장이어도 기초 해외면 감점",
+   fx_pt_of(is_krw_listed=True, fx_exposed=True) < 10.0, True)
+eq("상장 시장이 아니라 기초자산 기준",
+   fx_pt_of(is_krw_listed=True, fx_exposed=True)
+   == fx_pt_of(is_krw_listed=False, fx_exposed=True), True)
 
 # --- 국내 지급주기 도출 ---
 from collector.run_kr import infer_pays_per_year, symbol
@@ -138,6 +165,21 @@ eq("월배당 주기 도출", infer_pays_per_year(mk(30, 14)), 12)
 eq("분기배당 주기 도출", infer_pays_per_year(mk(91, 10)), 4)
 eq("이력 부족시 판단 보류", infer_pays_per_year(mk(30, 2)), None)
 eq("국내 심볼 변환", symbol('458730'), '458730.KS')
+
+# --- 스키마 마이그레이션 ---
+from db.migrate import MIGRATIONS
+eq("마이그레이션 등록됨", len(MIGRATIONS) > 0, True)
+# 생성 구문은 반복 실행에 안전해야 한다. UPDATE 는 조건이 붙어 멱등이면 허용.
+eq("생성 구문은 IF NOT EXISTS",
+   all("IF NOT EXISTS" in sql for _, sql in MIGRATIONS
+       if sql.strip().upper().startswith(("ALTER", "CREATE"))), True)
+eq("UPDATE 는 WHERE 필수",
+   all("WHERE" in sql.upper() for _, sql in MIGRATIONS
+       if sql.strip().upper().startswith("UPDATE")), True)
+eq("삭제·타입변경 없음",
+   not any(w in sql.upper() for _, sql in MIGRATIONS
+           for w in ("DROP ", "TRUNCATE", "ALTER COLUMN", "DELETE ")), True)
+eq("이름 중복 없음", len({n for n, _ in MIGRATIONS}), len(MIGRATIONS))
 
 # --- 동기화 기록 (dry-run 은 쓰지 않는다) ---
 from collector.store import Store as _Store
@@ -278,6 +320,206 @@ eq("기초 잔고 없으면 표시 0", only_known.opening_qty, 0.0)
 
 loss = position_return([Lot('L', 100, 100.0, 1400.0)], 90.0, 1400.0, dividends_since=2_000_000)
 eq("시세손실을 배당이 메우는 경우", loss.price_gain_krw < 0 and loss.total_gain_krw > 0, True)
+
+# --- 분배금 지속가능성 ---
+from engine.dividend import compute as div_compute
+from engine.dividend import describe as div_describe
+
+# 분기배당이 매년 10%씩 성장하는 종목
+grow = []
+v = 1.0
+for _ in range(24):
+    grow.append(v)
+    v /= (1.10 ** 0.25)          # 최근순이므로 거꾸로 감소
+g = div_compute(grow, 4)
+eq("성장 종목 3년 CAGR 양수", g.cagr3 > 0, True)
+eq("감액 없으면 0회", g.cuts, 0)
+eq("성장 종목 고득점", g.score >= 12, True)
+
+# 매년 줄어드는 종목
+shrink = [1.0 * (1.08 ** (i / 4)) for i in range(24)]   # 최근이 가장 작음
+sh = div_compute(shrink, 4)
+eq("감소 종목 CAGR 음수", sh.cagr3 < 0, True)
+eq("감액 이력 잡힘", sh.cuts > 0, True)
+eq("감소 종목 저득점", sh.score < g.score, True)
+
+eq("이력 부족은 미산출", div_compute([1.0, 1.0], 4).available, False)
+# 달력 연도로 자르면 지급이 밀린 해에 회차가 어긋난다. 횟수로 자른다.
+eq("13회는 3년치로 묶임", div_compute([1.0] * 13, 4).years, 3)
+eq("12회는 3년치", div_compute([1.0] * 12, 4).years, 3)
+eq("설명에 감액 표시", "감액" in div_describe(sh)[1], True)
+eq("배점 상한 15", g.score <= 15, True)
+
+# --- 데이터 신뢰도 ---
+# 비어 있는 항목은 절반 점수를 자동으로 받는다. 그걸 알리지 않으면
+# 사용자는 그 숫자를 실제 분석 결과로 오해한다.
+full_input = dict(ticker='C', price=100.0, ttm_dps=4.0, yield_history=[3.5] * 30,
+                  ma200_slope=0.02, drawdown=-0.05, change_20d=0.0,
+                  dps_ttm_prev=3.7, dps_score=10.0, risk_score=7.0,
+                  exdrop_ratio=0.9, exdrop_samples=12,
+                  fx_history=[1300 + i * 5 for i in range(40)], fx_now=1400,
+                  fx_exposed=True)
+rich = sc(ScoreInput(**full_input))
+poor = sc(ScoreInput(ticker='E', price=100.0, ttm_dps=4.0))
+eq("데이터 충분하면 신뢰도 높음", rich.confidence >= 80, True)
+eq("데이터 없으면 신뢰도 낮음", poor.confidence < 50, True)
+eq("신뢰도 낮으면 판단보류", poor.grade, "판단보류")
+eq("신뢰도 경고", any('신뢰하기 어렵' in w for w in poor.warnings), True)
+
+# --- 환율: 기초자산 통화 기준 ---
+# 원화 상장이어도 기초자산이 해외면 환율에 그대로 노출된다.
+fxh = [1250 + i * 7 for i in range(40)]
+def fx_pt(**kw):
+    r = sc(ScoreInput('F', 100.0, 4.0, fx_history=fxh, fx_now=1500, **kw))
+    return [f for f in r.facts if f[0] == '환율'][0][3]
+eq("국내상장·해외자산도 감점", fx_pt(is_krw_listed=True, fx_exposed=True) < 5, True)
+eq("국내자산은 환율 만점", fx_pt(is_krw_listed=True, fx_exposed=False), 10)
+eq("환헤지는 만점 아님", 5 < fx_pt(fx_exposed=True, fx_hedged=True) < 10, True)
+eq("상장통화로 판단하지 않음",
+   fx_pt(is_krw_listed=True, fx_exposed=True) == fx_pt(fx_exposed=True), True)
+
+# --- 위험조정 수익 ---
+from engine.risk import compute as risk_compute
+from engine.risk import describe as risk_describe
+import random as _rnd
+_rnd.seed(11)
+def series(mu, sigma, n=760):
+    px = [100.0]
+    for _ in range(n):
+        px.append(px[-1] * (1 + _rnd.gauss(mu, sigma)))
+    return px
+
+low = risk_compute(series(0.0004, 0.005))    # 저변동
+high = risk_compute(series(0.0006, 0.015))   # 고변동·고수익
+eq("위험지표 산출", low.available, True)
+eq("고수익이어도 고변동이면 낮은 점수", low.score > high.score, True)
+eq("점수 0~10", 0 <= low.score <= 10 and 0 <= high.score <= 10, True)
+eq("최대낙폭 음수", high.mdd < 0, True)
+eq("표본 부족은 미산출", risk_compute([100.0] * 50).available, False)
+eq("부족 사유 안내", "200일 필요" in risk_compute([100.0] * 50).reason, True)
+
+# 최솟값 방식: 한 지표만 나빠도 전체가 낮아져야 한다.
+# 평균이면 다른 지표가 덮어준다 — 위험은 가장 나쁜 얼굴로 봐야 한다.
+from engine.risk import _scale
+eq("최솟값 가중", round(min(8.0, 2.0) * 0.7 + 9.0 * 0.3, 1), 4.1)
+eq("상승참여율 산출",
+   risk_compute(series(0.0004, 0.005), benchmark_cagr=0.20).capture is not None, True)
+eq("설명 문구에 낙폭 포함", "최대낙폭" in risk_describe(low)[1], True)
+
+# --- 상품 품질 / 매수 타점 분리 ---
+from engine.score import QUALITY_FLOOR
+# 신뢰도가 낮으면 '판단보류'가 먼저 걸리므로, 축 분리를 시험하려면
+# 데이터를 모두 채워야 한다. 실제로 이 때문에 검증이 실패했다.
+two = dict(ticker='Q', price=100.0, ttm_dps=4.0, yield_history=[3.5] * 30,
+           ma200_slope=0.02, drawdown=-0.05, change_20d=0.0,
+           dps_ttm_prev=3.7, dps_score=10.0, risk_score=7.0,
+           exdrop_ratio=0.9, exdrop_samples=12,
+           fx_history=[1300 + i * 5 for i in range(40)], fx_now=1400,
+           fx_exposed=True)
+r2 = sc(ScoreInput(**two))
+eq("품질 0~100", 0 <= r2.quality <= 100, True)
+_full = sc(ScoreInput('F', 100.0, 4.0, yield_history=[3.0] * 20,
+                      ma200_slope=0.02, drawdown=-0.05, change_20d=0.0,
+                      dps_ttm_prev=3.7, dps_score=10.0, risk_score=7.0,
+                      fx_history=[1300.0] * 20, fx_now=1400.0,
+                      exdrop_ratio=0.9, exdrop_samples=12))
+eq("데이터 완전하면 신뢰도 100", _full.confidence, 100)
+eq("데이터 없으면 신뢰도 0", sc(ScoreInput('N', 100.0, 4.0)).confidence, 0)
+eq("신뢰도 낮으면 경고에 명시",
+   any('신뢰도' in w for w in sc(ScoreInput('N', 100.0, 4.0)).warnings), True)
+eq("타점 0~100", 0 <= r2.timing <= 100, True)
+eq("종합은 품질6:타점4", r2.total, round(r2.quality * 0.6 + r2.timing * 0.4))
+
+# 품질이 낮으면 타점이 좋아도 제외한다. 나쁜 상품을 싸다고 사면 안 된다.
+bad = dict(two, risk_score=0.5, dps_score=1.0, exdrop_ratio=1.8)
+rb = sc(ScoreInput(**bad))
+eq("품질 미달은 제외", rb.excluded, rb.quality < QUALITY_FLOOR)
+eq("신뢰도 충분", rb.confidence >= 50, True)
+eq("제외는 등급도 제외", rb.grade if rb.excluded else '제외', '제외')
+eq("제외 사유 경고", any('품질' in w for w in rb.warnings), True)
+
+# 배당이 늘어서 오른 배당률은 품질로, 주가가 빠져서면 타점으로 간다
+hist = [3.0] * 20
+grow = sc(ScoreInput(ticker='G', price=100.0, ttm_dps=5.0, yield_history=hist,
+                     dps_ttm_prev=4.0, exdrop_ratio=0.9, exdrop_samples=12))
+drop = sc(ScoreInput(ticker='D', price=100.0, ttm_dps=5.0, yield_history=hist,
+                     dps_ttm_prev=5.0, exdrop_ratio=0.9, exdrop_samples=12))
+eq("배당 성장은 품질로", grow.quality > drop.quality, True)
+eq("주가 하락은 타점으로", drop.timing > grow.timing, True)
+
+# --- 가격 위치: 추세 중심 ---
+# "높으면 감점" 은 오르는 종목을 계속 깎고 하락 추세에 가점을 주는 구조였다.
+def price_pt2(**kw):
+    r = sc(ScoreInput(ticker='P', price=100.0, ttm_dps=4.0, **kw))
+    return [f for f in r.facts if f[0] == '가격 위치'][0][3]
+
+up_dip = price_pt2(ma200_slope=0.03, drawdown=-0.08, change_20d=-0.02)
+up_high = price_pt2(ma200_slope=0.03, drawdown=0.0, change_20d=0.02)
+down = price_pt2(ma200_slope=-0.04, drawdown=-0.15, change_20d=-0.05)
+spike = price_pt2(ma200_slope=0.02, drawdown=0.0, change_20d=0.15)
+eq("상승추세+조정이 최고점", up_dip > up_high > down, True)
+eq("하락추세는 많이 빠져도 낮음", down < up_high, True)
+eq("단기 급등은 감점", spike < up_high, True)
+eq("하락추세 경고", any('하락 추세' in w for w in
+   sc(ScoreInput('P', 100.0, 4.0, ma200_slope=-0.04)).warnings), True)
+
+# --- 배당률: 절대 수준과 위치 분리 ---
+# 이력 대비 위치만 보면 배당률 0.44% 인 QQQ 가 만점을 받는다.
+def yield_parts(y, hist):
+    r = sc(ScoreInput('Y', 100.0, y, yield_history=hist, drawdown=-0.01))
+    lv = [f for f in r.facts if f[0] == '배당률 수준'][0][3]
+    po = [f for f in r.facts if f[0] == '배당률 위치'][0][3]
+    return lv, po
+
+flat = [1.0] * 30
+low_lv, _ = yield_parts(0.5, [0.4] * 30)
+mid_lv, _ = yield_parts(3.5, [3.4] * 30)
+hi_lv, _ = yield_parts(12.0, [11.0] * 30)
+eq("저배당은 수준 낮음", low_lv < 5, True)
+eq("적정 배당은 수준 만점", mid_lv, 18.0)
+eq("초고배당은 함정 감점", hi_lv < mid_lv, True)
+
+# 주가가 고점인데 "싸다" 고 하면 모순이다
+near_high = sc(ScoreInput('H', 100.0, 5.0, yield_history=[3.0] * 20,
+                          dps_ttm_prev=4.0, drawdown=-0.01))
+band = [f for f in near_high.facts if f[0] == '배당률 위치'][0][2]
+eq("고점이면 '주가는 고점' 표기", '고점' in band, True)
+
+# --- 단기 과열 / 배당률 원인 구분 ---
+# 배당률이 높은 이유가 배당 성장인지 주가 하락인지 갈라야 한다
+hi = [3.0] * 20
+grown = sc(ScoreInput(ticker='G', price=100.0, ttm_dps=5.0,
+                      yield_history=hi, dps_ttm_prev=4.0))
+fell = sc(ScoreInput(ticker='F', price=100.0, ttm_dps=5.0,
+                     yield_history=hi, dps_ttm_prev=5.0))
+eq("배당 성장이면 그렇게 표시",
+   '배당이 늘어서' in [f for f in grown.facts if f[0] == '배당률 위치'][0][2], True)
+
+# --- 배당락 지표 ---
+from engine.exdrop import ExDropSample, compute_sample, summarize, describe
+def mk_ex(before, open_px, dps, market=0.0, fwd=None):
+    s = ExDropSample(ex_date=date(2026, 1, 5), dps=dps, before_close=before,
+                     open_px=open_px, close_px=open_px, low_px=open_px * 0.99,
+                     market_change=market)
+    return compute_sample(s, fwd or [])
+
+# 100원 종가 → 시가 99원, 배당 1원. 시장이 안 움직였으면 딱 1.0배
+eq("보정 없을 때 1.0배", mk_ex(100, 99, 1.0, 0.0).drop_ratio, 1.0)
+# 같은 상황에서 시장이 1% 빠졌다면 배당 탓은 0원 → 0.0배
+eq("시장 하락분 제거", mk_ex(100, 99, 1.0, -0.01).drop_ratio, 0.0)
+# 시장이 1% 올랐는데 1원 빠졌다면 배당 탓은 2원어치 → 2.0배
+eq("시장 상승분 반영", mk_ex(100, 99, 1.0, 0.01).drop_ratio, 2.0)
+
+fwd = [(date(2026, 1, 5), 99.0), (date(2026, 1, 6), 99.5), (date(2026, 1, 7), 100.5)]
+eq("회복일 계산", mk_ex(100, 99, 1.0, 0.0, fwd).open_recovery, 2)
+eq("미회복은 None", mk_ex(100, 99, 1.0, 0.0, [(date(2026,1,5), 99.0)]).open_recovery, None)
+
+st = summarize([mk_ex(100, 99, 1.0, 0.0) for _ in range(5)])
+eq("중앙값 산출", st.drop_ratio, 1.0)
+eq("표본 수", st.samples, 5)
+eq("3회 미만은 미산출", summarize([mk_ex(100, 99, 1.0)] * 2).drop_ratio, None)
+eq("극단값 제외", summarize([mk_ex(100, 99, 0.01) for _ in range(5)]).samples, 0)
+eq("설명 문구", describe(st)[0], "1.00배")
 
 # --- 적립 시뮬레이션 ---
 from engine.projection import simulate, common_start, growth_quality

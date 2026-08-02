@@ -52,16 +52,22 @@ class Store:
         self._bump("quotes")
 
     def upsert_history(self, ticker: str, series: list, src: str) -> dict:
-        """일별 종가를 넣고, 마지막 날짜 기준 200일선·52주 고저를 계산해 함께 저장한다.
+        """일별 시세를 넣고, 마지막 날짜 기준 200일선·52주 고저를 계산해 함께 저장한다.
 
         계산을 SQL이 아니라 여기서 하는 이유: 표본이 모자랄 때 '억지로 만든 값'을
         넣지 않고 None 으로 두기 위해서다. 200일치가 없으면 200일선은 없는 게 맞다.
         """
         if not series:
             return {}
-        series = sorted(series)
-        # (날짜, 종가) 또는 (날짜, 종가, 수정종가) 둘 다 받는다
-        series = [(row[0], row[1], row[2] if len(row) > 2 else None) for row in series]
+
+        # 소스마다 튜플 길이가 다르다(일봉 5개, 월봉 3개). 5개로 맞춘다.
+        # 길이를 가정하면 "not enough values to unpack" 으로 수집 전체가 죽는다.
+        def pad(row):
+            row = tuple(row)
+            return row + (None,) * (5 - len(row)) if len(row) < 5 else row[:5]
+
+        series = sorted(pad(row) for row in series)
+
         # 과거 월봉이 섞여 있을 수 있으므로, 지표는 '연속된 일봉 구간'에서만 낸다.
         # 직전 관측과 7일 넘게 벌어진 지점 이후를 일봉으로 본다.
         daily_start = 0
@@ -69,26 +75,42 @@ class Store:
             if (series[i][0] - series[i - 1][0]).days > 7:
                 daily_start = i
                 break
-        daily = [c for _, c, _ in series[daily_start:]]
-        ma200 = round(sum(daily[-200:]) / 200, 4) if len(daily) >= 200 else None
-        window = daily[-252:] if len(daily) >= 252 else None
-        high52 = round(max(window), 4) if window else None
-        low52 = round(min(window), 4) if window else None
+        daily_rows = series[daily_start:]
+        daily = [row[1] for row in daily_rows]
 
-        for day, close, adj in series:
-            last = day == series[-1][0]
+        # 200일선을 마지막 날짜에만 저장하면 추세(기울기)를 낼 수 없다.
+        # 실제로 그 때문에 200일선 기울기가 항상 비어 있었다. 매일 계산해 넣는다.
+        indicators = {}
+        for i in range(len(daily)):
+            if i >= 199:
+                ma = round(sum(daily[i - 199:i + 1]) / 200, 4)
+            else:
+                ma = None
+            if i >= 251:
+                window = daily[i - 251:i + 1]
+                hi, lo = round(max(window), 4), round(min(window), 4)
+            else:
+                hi = lo = None
+            indicators[daily_rows[i][0]] = (ma, hi, lo)
+
+        ma200 = indicators.get(series[-1][0], (None, None, None))[0]
+        high52 = indicators.get(series[-1][0], (None, None, None))[1]
+        low52 = indicators.get(series[-1][0], (None, None, None))[2]
+
+        for day, close, adj, open_px, low_px in series:
+            ind = indicators.get(day, (None, None, None))
             self.execute(
                 """INSERT INTO etf_price_daily
-                     (ticker,date,close,adj_close,ma200,high52,low52,src)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                     (ticker,date,close,open,low,adj_close,ma200,high52,low52,src)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (ticker,date) DO UPDATE
-                     SET close=EXCLUDED.close, adj_close=EXCLUDED.adj_close,
-                         ma200=EXCLUDED.ma200,
+                     SET close=EXCLUDED.close,
+                         open=COALESCE(EXCLUDED.open, etf_price_daily.open),
+                         low=COALESCE(EXCLUDED.low, etf_price_daily.low),
+                         adj_close=EXCLUDED.adj_close, ma200=EXCLUDED.ma200,
                          high52=EXCLUDED.high52, low52=EXCLUDED.low52""",
-                (ticker, day, close, adj,
-                 ma200 if last else None,
-                 high52 if last else None,
-                 low52 if last else None, src))
+                (ticker, day, close, open_px, low_px, adj,
+                 ind[0], ind[1], ind[2], src))
         self._bump("prices", len(series))
         return {"ma200": ma200, "high52": high52, "low52": low52,
                 "days": len(series)}
