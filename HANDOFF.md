@@ -1,116 +1,1155 @@
-# HANDOFF — Claude Code 첫 세션에서 읽을 문서
+import React, { useCallback, useEffect, useState } from 'react'
+import { api, DOC } from './api.jsx'
+import {
+  commafy, GRADE, label, MODES, pct, qty, shortLabel,
+  signed, signedPct, uncomma, usd, won,
+} from './format.js'
+import { enablePush, disablePush, isSubscribed, pushStatus } from './push.js'
 
-작성 2026-07-30 / 이관 전 위치: claude.ai 채팅 세션
-먼저 `CLAUDE.md` 를 읽어라. 이 문서는 "지금 당장 뭘 할지"만 담는다.
+/* ── 공통 ─────────────────────────────── */
 
----
+const InfoBtn = ({ k, onOpen }) => (
+  <button className="info" aria-label="설명 보기" onClick={() => onOpen(k)}>i</button>
+)
 
-## 0. 이관 직후 30분
+function Sheet({ docKey, onClose }) {
+  if (!docKey) return null
+  const [title, body] = DOC[docKey] || ['설명', null]
+  return (
+    <div className="sheet" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="sheet-in">
+        <h3>{title}</h3>
+        {body}
+        <button className="btn" onClick={onClose}>닫기</button>
+      </div>
+    </div>
+  )
+}
 
-```bash
-# ① 코드 올리기 (EC2에서)
-mkdir -p ~/divdesk && cd ~/divdesk        # tar 풀거나 git clone
-git init && git add -A && git commit -m "init: 스키마·어댑터·미국수집기"
+function Notes({ items, title = '계산 기준과 주의사항' }) {
+  const [open, setOpen] = useState(false)
+  if (!items?.length) return null
+  return (
+    <div className="fold">
+      <button className="fold-head" onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span>{title} ({items.length})</span>
+        <span className="fold-mark">{open ? '−' : '+'}</span>
+      </button>
+      {open && <div className="fold-body">{items.map((n, i) => <p key={i}>{n}</p>)}</div>}
+    </div>
+  )
+}
 
-# ② 의존성
-python3 -m venv .venv && source .venv/bin/activate
-make install
+const Err = ({ msg }) => msg ? <div className="warn">{msg}</div> : null
 
-# ③ Postgres
-sudo apt install -y postgresql
-sudo -u postgres createuser divdesk -P
-sudo -u postgres createdb -O divdesk divdesk
-cp .env.example .env && chmod 600 .env     # DSN 채우기
-set -a && source .env && set +a
-make db
+// 지급주기 코드를 사람 말로. 월배당인지 분기배당인지가 종목을 고르는 첫 기준인데
+// 마스터에만 있고 화면에는 안 나오고 있었다.
+const PAY_LABEL = { M: '월배당', Q: '분기배당', SA: '반기배당', A: '연배당' }
 
-# ④ 검증 게이트가 도는지 확인
-make verify                                # 4단계 전부 통과해야 함
+// 만원 단위. 막대 위에 숫자가 없으면 높이만 보고 크기를 가늠해야 한다.
+const manwon = (v) => {
+  const n = Math.round(Number(v) / 10000)
+  return n > 0 ? n.toLocaleString('ko-KR') : ''
+}
 
-# ⑤ 미국 수집 실적재
-make collect
-```
+function MonthStrip({ values, labels, marks }) {
+  const max = Math.max(...values.map(v => Math.abs(Number(v) || 0)), 1)
+  if (!values.length || values.every(v => !v)) {
+    return <div className="empty">표시할 입금 내역이 없습니다.</div>
+  }
+  return (
+    <>
+      <div className="strip">
+        {values.map((v, i) => (
+          <div className="mo" key={i} title={`${won(v)}원`}>
+            <em className="mo-v">{manwon(v)}</em>
+            <div className={v > 0 ? (marks && marks[i] === false ? 'bar est' : 'bar') : 'bar zero'}
+              style={{ height: v > 0 ? `${Math.max(4, (v / max) * 100)}%` : '3px' }} />
+            <b>{labels ? labels[i] : i + 1}</b>
+          </div>
+        ))}
+      </div>
+      <div className="legend">
+        <span>단위: 만원</span>
+        {marks && <><span><i className="sw" />확정</span><span><i className="sw est" />추정</span></>}
+      </div>
+    </>
+  )
+}
 
-`make collect` 가 21종목 성공을 찍으면 이관 완료다.
+/* ── 계산기 ───────────────────────────── */
 
----
+function Calculator({ etfs, onDoc }) {
+  const [mode, setMode] = useState('US_TAXABLE')
+  const [dir, setDir] = useState('forward')
+  const [target, setTarget] = useState('1,000,000')
+  const [items, setItems] = useState([])
+  const [sel, setSel] = useState('')
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
 
-## 1. 첫 실제 작업
+  const usable = etfs.filter(e => e.close != null)
 
-MVP 코딩은 전부 끝났다. 남은 건 배포와 2차 과제다.
-`make probe` 는 이제 필수가 아니다 — 국내 수집이 야후 `.KS` 로 해결되어
-네이버 엔드포인트에 의존하지 않는다.
 
-배포 후 첫 확인:
-```bash
-make collect     # 미국 21 + 국내 10
-make serve &     # API
-make score       # 스코어 산출
-curl -s localhost:8000/scores | head
-```
+  const selMeta = usable.find(e => e.ticker === sel)
+  const tickers = items.map(i => i.ticker)
+  const totalAmount = items.reduce((a, i) => a + i.amount, 0)
+  const onAdd = (row) => setItems(p => [...p.filter(x => x.ticker !== row.ticker), row])
+  const onRemove = (t) => setItems(p => p.filter(x => x.ticker !== t))
+  // 종목별 금액은 각 줄에서 직접 고친다. 예전에는 담기 전에 금액을 한 번 넣고 나면
+  // 그 뒤로 못 바꿔서, 배분을 조정하려면 지우고 다시 담아야 했다.
+  const onAmount = (t, v) =>
+    setItems(p => p.map(x => (x.ticker === t ? { ...x, amount: v } : x)))
 
----
+  const run = async () => {
+    setBusy(true); setErr(''); setData(null)
+    try {
+      const body = dir === 'forward'
+        ? await api.forward({
+            amount_krw: totalAmount, tickers, account_mode: mode,
+            weights: Object.fromEntries(items.map(i => [i.ticker, i.amount])),
+          })
+        : await api.reverse({
+            target_monthly_krw: uncomma(target), tickers, account_mode: mode,
+          })
+      setData(body)
+    } catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
 
-## 2. 남은 코딩 리스트
+  const fwd = data && (dir === 'forward' ? data.result : data.result.forward)
+  const rev = data && dir === 'reverse' ? data.result : null
 
-```
-[x]  전 항목 완료 (16/16)
-[x]  1. Postgres 스키마 + tax_param 시딩
-[x]  2. 소스 어댑터 레이어 + 계약검증 + raw_snapshot
-[x]  3. 수집기 A 미국 — 야후 + stockanalysis 교차검증
-[x]  4. 수집기 B 국내 — 야후 .KS 경유
-[x]  5. 국내 분배금 + 지급주기 데이터 도출
-[ ]  6. FastAPI 골격 + 조회 API
-[ ]  7. 세금 엔진 3모드 + 단위테스트
-[ ]  8. 정방향 계산 API (금액 → 세후 월배당)
-[ ]  9. 역방향 계산 API (목표배당 → 필요금액·정수 주수 루프)
-[x] 10. 스코어 엔진 배치 + 근거문장 생성
-[x] 11. React 골격 — docs/divdesk-mockup.html 컴포넌트화
-[x] 12. 계산기 화면 연동
-[x] 13. 타점 화면 연동 + 커버드콜 배지
-[x] 14. 매수기록 CRUD
-[x] 15. 금융소득 워치독
-[x] 16. 12개월 입금 스트립 (확정/추정 구분)
-```
-2차: 배당예상일지 캘린더 / `holiday_kr` 적재 / 웹푸시 SW+VAPID / 알람 규칙 UI
+  return (
+    <>
+      <div className="card">
+        <h2>계산 방향 <InfoBtn k="dir" onOpen={onDoc} /></h2>
+        <label>계좌</label>
+        <select value={mode} onChange={e => { setMode(e.target.value); setData(null) }}>
+          {MODES.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}
+        </select>
+        {mode === 'KR_SHELTER' && (
+          <div className="hint">절세계좌에는 국내상장 ETF만 담을 수 있습니다.</div>
+        )}
+        <div style={{ marginTop: 14 }} />
+        <div className="dir">
+          <button aria-selected={dir === 'forward'} onClick={() => { setDir('forward'); setData(null) }}>
+            금액 → 월배당
+          </button>
+          <button aria-selected={dir === 'reverse'} onClick={() => { setDir('reverse'); setData(null) }}>
+            월배당 → 필요금액
+          </button>
+        </div>
 
----
+        {dir === 'reverse' && (
+          <>
+            <label style={{ marginTop: 14 }}>목표 월배당 (세후)</label>
+            <div className="field">
+              <input inputMode="numeric" value={target}
+                onChange={e => setTarget(commafy(e.target.value))} />
+              <em>원</em>
+            </div>
+          </>
+        )}
 
-## 3. 이미 밟은 함정 (다시 밟지 마라)
+        <div style={{ marginTop: 16 }}>
+          <label>담을 종목과 금액</label>
+          {usable.length === 0
+            ? <div className="empty">수집된 가격 데이터가 있는 종목이 없습니다.</div>
+            : <>
+                <select value={sel} onChange={e => setSel(e.target.value)}>
+                  <option value="">종목 선택</option>
+                  {usable.map(e => (
+                    <option key={e.ticker} value={e.ticker}>{label(e)}</option>
+                  ))}
+                </select>
+                {selMeta && (
+                  <>
+                    <div className="pick-info">
+                      <span className="tag">{selMeta.strategy}</span>
+                      {/* 배당 횟수는 마스터에 있는데 화면에 안 나오고 있었다.
+                          월배당인지 분기배당인지가 담을 종목을 고르는 첫 기준이다. */}
+                      {selMeta.pay_freq &&
+                        <span className="tag">{PAY_LABEL[selMeta.pay_freq] || selMeta.pay_freq}</span>}
+                      {selMeta.expense_ratio != null &&
+                        <span className="tag">보수 {selMeta.expense_ratio}%</span>}
+                      {selMeta.score != null && <span className="tag">타점 {selMeta.score}점</span>}
+                      {selMeta.is_covered_call &&
+                        <span className="tag warn-tag">분배금 ≠ 수익</span>}
+                    </div>
+                    {/* 개별 보유 종목은 수집하지 않는다. 대신 추종 지수와 성격을 보여준다 —
+                        "무엇을 담고 있는 상품인가" 에 실질적으로 답하는 정보다. */}
+                    {(selMeta.tags?.index || selMeta.tags?.note) && (
+                      <div className="hint" style={{ marginTop: 6 }}>
+                        {selMeta.tags.index && <>지수 {selMeta.tags.index}</>}
+                        {selMeta.tags.index && selMeta.tags.note && ' · '}
+                        {selMeta.tags.note}
+                      </div>
+                    )}
+                  </>
+                )}
+                {/* 금액은 담은 뒤 종목별 줄에서 입력한다. 담기 전에 한 번만 받으면
+                    여러 종목 배분을 비교하며 조정할 수 없다. */}
+                <button className="btn ghost" disabled={!sel}
+                  onClick={() => {
+                    onAdd({ ticker: sel, amount: 0, meta: selMeta })
+                    setSel('')
+                  }}>담기</button>
 
-| 함정 | 사실 |
-|---|---|
-| TTM 배당금을 "최근 370일"로 자름 | 지급일이 밀리면 1회 더 잡혀 배당률 과대. HDV 3.03%→2.37%. **횟수로 자를 것** |
-| `dividendhistory.net` 을 교차검증 소스로 | 503 반환. 후보에서 제외했다 |
-| 남이 Vercel에 올린 공개 API 직접 호출 | 수명·레이트리밋·검증 불가. 수집 로직만 참고하고 직접 긁는다 |
-| 분배금 지급주기를 사람이 안다고 가정 | **3회 반복된 결함.** 기간절단 과대계산, 국내 3종 분기→월 오등록. 이제 `infer_pays_per_year()` 로 이력에서 도출 |
-| 종목코드를 이름으로 추정 | 476850을 RISE 미국배당100으로 등록했으나 실제는 KoAct 배당성장액티브. 야후 등록명으로 반드시 대조 |
-| 국내 배당 캘린더를 미국 규칙으로 계산 | 국내는 지급기준일(월말/월중15일) 기준이고 분배락과 지급일 사이 공백이 연휴 때 최대 1주. `holiday_kr` 없이는 계산 금지 |
-| 커버드콜 고배당을 좋은 점수로 처리 | 분배금에 옵션 프리미엄·원금환급이 섞여 총수익이 마이너스일 수 있다. 배지 강제 |
+                {items.length > 0 && (
+                  <div className="picked">
+                    {items.map(i => (
+                      <div className="picked-row amt-row" key={i.ticker}>
+                        <span>{label(i.meta) || i.ticker}</span>
+                        <span className="field inline">
+                          <input inputMode="numeric" placeholder="금액"
+                            value={i.amount ? commafy(String(i.amount)) : ''}
+                            onChange={ev =>
+                              onAmount(i.ticker, uncomma(ev.target.value))} />
+                          <em>원</em>
+                        </span>
+                        <button className="del"
+                          onClick={() => onRemove(i.ticker)}>삭제</button>
+                      </div>
+                    ))}
+                    <div className="picked-row total">
+                      <span>합계 {items.length}종목</span>
+                      <b className="num">{won(totalAmount)}원</b>
+                      <span />
+                    </div>
+                  </div>
+                )}
+              </>}
+        </div>
 
----
+        <button className="btn"
+          disabled={busy || !items.length || (dir === 'forward' && totalAmount <= 0)}
+          onClick={run}>
+          {busy ? '계산 중…' : '계산하기'}
+        </button>
+        <Err msg={err} />
+      </div>
 
-## 4. 세금 모델 요약 (7번 작업용)
+      {rev && (
+        <div className="card">
+          <h2>필요 금액</h2>
+          <div className="result" style={{ borderTop: 0, paddingTop: 0, marginTop: 0 }}>
+            <div className="lbl">월 {won(rev.target_monthly_krw)}원을 받으려면</div>
+            <div className="big">{won(rev.required_krw)}원</div>
+            <div className="rows">
+              {rev.plan.map(p => (
+                <div className="row" key={p.ticker}>
+                  <span>{p.ticker}</span>
+                  <b className="num">{qty(p.qty)}주 · {won(p.cost_krw)}원</b>
+                </div>
+              ))}
+              <div className="row">
+                <span>달성 예상</span>
+                <b className="num">{won(rev.achieved_monthly_krw)}원 ({rev.achieved_pct}%)</b>
+              </div>
+            </div>
+          </div>
+          <Notes items={rev.notes} />
+        </div>
+      )}
 
-| 모드 | 분배금 | 매매차익 | 비고 |
-|---|---|---|---|
-| `US_TAXABLE` 일반계좌·미국상장 | 현지 15% 원천징수. 한국 14%보다 높아 통상 추가납부 없음 | 양도세 22%, 연 250만 공제, 분리과세 | 지방세 1.4%분은 외국납부세액공제 처리에 따라 달라짐 → 실효 15%로 계산하고 화면에 주석 |
-| `KR_TAXABLE` 일반계좌·국내상장 | 15.4% 원천징수 | **매매차익도 배당소득으로 15.4%** | 2025년부터 외국납부세액 선환급 폐지 → 실효세율 상승 반영 |
-| `KR_SHELTER` 절세계좌 | 즉시 과세 없음(과세이연) | 동일 | 국내상장만 편입 가능 → `kr_alt_ticker` 로 대체종목 제시 |
+      {fwd && (
+        <>
+          <div className="card">
+            <h2>세후 월평균 배당 <InfoBtn k="avg" onOpen={onDoc} /></h2>
+            <div className="result" style={{ borderTop: 0, paddingTop: 0, marginTop: 0 }}>
+              <div className="big">{won(fwd.monthly_avg_net_krw)}원</div>
+              <div className="rows">
+                <div className="row"><span>투자 원금</span><b className="num">{won(fwd.invested_krw)}원</b></div>
+                <div className="row"><span>연 세전 배당</span><b className="num">{won(fwd.annual_gross_krw)}원</b></div>
+                <div className="row">
+                  <span>세금 <InfoBtn k="tax" onOpen={onDoc} /></span>
+                  <b className="num minus">-{won(fwd.annual_tax_krw)}원</b>
+                </div>
+                <div className="row"><span>가중 배당률</span><b className="num">{fwd.weighted_yield_pct}%</b></div>
+              </div>
+            </div>
+            <Notes items={fwd.notes} />
+          </div>
 
-공통: 연 금융소득 2,000만원 초과 시 종합과세(누진). 워치독은 80% 도달 시 경고.
-**세율 상수는 전부 `tax_param` 테이블에서 읽는다. 코드에 숫자를 쓰지 마라.**
-2026년 배당소득 분리과세 개정 논의가 진행 중이므로 값 교체가 SQL 한 줄로 끝나야 한다.
+          <div className="card">
+            <h2>월별 실제 입금 <InfoBtn k="strip" onOpen={onDoc} /></h2>
+            <MonthStrip values={fwd.monthly_breakdown} />
+            <div className="asof" style={{ marginTop: 8 }}>
+              환율 {data.fx?.toLocaleString('ko-KR')}원 (기준 {data.fx_date})
+            </div>
+          </div>
+        </>
+      )}
+    </>
+  )
+}
 
----
+/* ── 적립 시뮬레이션 ───────────────────── */
 
-## 5. 데이터 소스 현황
+function Projection({ etfs, onDoc }) {
+  const [picked, setPicked] = useState(['SCHD'])
+  const [monthly, setMonthly] = useState('500')
+  const [cur, setCur] = useState('USD')
+  // 기간은 연+개월. 예전에는 5·10·15·20년 버튼뿐이라 '3년 6개월' 같은 걸 못 골랐다.
+  const [years, setYears] = useState(10)
+  const [months, setMonths] = useState(0)
+  const totalMonths = years * 12 + months
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
 
-| 소스 | 용도 | 상태 (2026-07-30 실측) |
-|---|---|---|
-| `query1.finance.yahoo.com/v8/finance/chart/{sym}?events=div` | 미국 가격·배당·USDKRW | **검증 OK, 21/21 성공, 무인증** |
-| `stockanalysis.com/etf/{sym}/dividend/` | 미국 배당 교차검증 | 200 OK, 느슨한 정규식 파싱 |
-| `query1.finance.yahoo.com/.../{코드}.KS` | **국내 시세·분배금** | **검증 OK, 10/10 성공, 원화** |
-| `finance.naver.com/api/...` | 국내 교차검증(선택) | 미검증, priority 60으로 격하 |
-| `data.krx.co.kr` | — | 403, 제외 |
-| `dividendhistory.net` | — | 503, 제외 |
+  const usable = etfs.filter(e => e.market === 'US' && e.close != null)
+  const toggle = (t) =>
+    setPicked(p => p.includes(t) ? p.filter(x => x !== t) : [...p, t])
+
+  const run = async () => {
+    setBusy(true); setErr(''); setData(null)
+    try {
+      setData(await api.projection({
+        monthly_usd: cur === 'KRW' ? uncomma(monthly) : Number(monthly),
+        currency: cur, years, months, tickers: picked,
+      }))
+    } catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
+
+  return (
+    <>
+      <div className="card">
+        <h2>적립 시뮬레이션 <InfoBtn k="proj" onOpen={onDoc} /></h2>
+
+        <label>통화</label>
+        <div className="dir">
+          {[['USD', '달러 $'], ['KRW', '원화 ₩']].map(([k, t]) => (
+            <button key={k} aria-selected={cur === k}
+              onClick={() => { setCur(k); setMonthly(k === 'USD' ? '500' : '700,000'); setData(null) }}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        <label style={{ marginTop: 16 }}>매달 넣을 금액</label>
+        <div className="field">
+          <em style={{ paddingLeft: 0, paddingRight: 8 }}>{cur === 'USD' ? '$' : '₩'}</em>
+          <input inputMode="numeric" value={monthly}
+            onChange={e => setMonthly(cur === 'KRW'
+              ? commafy(e.target.value) : e.target.value.replace(/[^0-9]/g, ''))} />
+        </div>
+
+        <label style={{ marginTop: 16 }}>기간</label>
+        <div className="period">
+          <span className="field inline">
+            <input inputMode="numeric" value={years}
+              onChange={ev => {
+                setYears(Math.min(30, Math.max(0, Number(ev.target.value.replace(/[^0-9]/g, '')) || 0)))
+                setData(null)
+              }} />
+            <em>년</em>
+          </span>
+          <span className="field inline">
+            <input inputMode="numeric" value={months}
+              onChange={ev => {
+                setMonths(Math.min(11, Math.max(0, Number(ev.target.value.replace(/[^0-9]/g, '')) || 0)))
+                setData(null)
+              }} />
+            <em>개월</em>
+          </span>
+          <span className="period-quick">
+            {[12, 36, 60, 120, 240].map(mm => (
+              <button key={mm} type="button" aria-selected={totalMonths === mm}
+                onClick={() => { setYears(Math.floor(mm / 12)); setMonths(mm % 12); setData(null) }}>
+                {mm / 12}년
+              </button>
+            ))}
+          </span>
+        </div>
+
+        <label style={{ marginTop: 16 }}>매수 종목</label>
+        <div className="picklist">
+          {usable.map(e => (
+            <button key={e.ticker} className="pick" aria-pressed={picked.includes(e.ticker)}
+              onClick={() => toggle(e.ticker)}>
+              <span className="pick-name">{label(e)}</span>
+              {/* 배당 주기와 추종 지수도 함께 보여준다. 종목을 고를 때 월배당인지
+                  분기배당인지, 무엇을 담는 상품인지가 보수·점수만큼 중요하다. */}
+              <span className="pick-meta">
+                {e.strategy}
+                {e.pay_freq && ` · ${PAY_LABEL[e.pay_freq] || e.pay_freq}`}
+                {e.expense_ratio != null && ` · 보수 ${e.expense_ratio}%`}
+                {e.score != null && ` · 타점 ${e.score}점`}
+                {e.is_covered_call && ' · 분배금 ≠ 수익'}
+              </span>
+              {(e.tags?.index || e.tags?.note) && (
+                <span className="pick-idx">
+                  {e.tags.index || e.tags.note}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+        <div className="hint">SPY·VOO·QQQ는 비교 기준으로 항상 함께 계산됩니다.</div>
+
+        <button className="btn"
+          disabled={busy || !picked.length || !Number(monthly) || totalMonths <= 0}
+          onClick={run}>
+          {busy ? '계산 중…' : '계산하기'}
+        </button>
+        <Err msg={err} />
+      </div>
+
+      {data && (
+        <div className="card">
+          <h2>{data.period_label || `${data.years}년`} 뒤 예상</h2>
+          <div className="hero-sub">
+            매달 {data.currency === 'KRW'
+              ? `${won(uncomma(monthly))}원 (약 $${Math.round(data.monthly_usd)})`
+              : `$${Number(monthly).toLocaleString()}`} × {(data.years ?? 0) * 12 + (data.months ?? 0)}개월
+            <br />총 ${data.total_invested_usd.toLocaleString()} ·
+            {' '}{won(data.total_invested_krw)}원 투입
+          </div>
+
+          {data.results.map(r => (
+            <div className="row-item" key={r.ticker}>
+              <div className="row-main">
+                <div className="tk">{r.ticker}
+                  {r.is_benchmark && <span className="tag bench">기준</span>}
+                </div>
+                <div className="kv">
+                  <span>최악 ${Math.round(r.worst_final_usd).toLocaleString()}</span>
+                  <span>최선 ${Math.round(r.best_final_usd).toLocaleString()}</span>
+                  {r.loss_windows > 0 && (
+                    <span style={{ color: 'var(--out)' }}>원금 미달 {r.loss_windows}회</span>
+                  )}
+                </div>
+                <div className="hint">
+                  데이터 {r.data_from?.slice(0, 7)}부터 {r.data_years}년치 ·
+                  시작 시점 {r.windows}가지 시험
+                </div>
+              </div>
+              <div className="row-right">
+                <b>${Math.round(r.median_final_usd).toLocaleString()}</b>
+                <s>{won(r.median_final_krw)}원</s>
+                <s style={{ color: 'var(--in)' }}>연 {pct(r.median_annual_pct)}</s>
+              </div>
+            </div>
+          ))}
+
+          <Notes items={[data.fx_note, data.period_note,
+            ...(data.results[0]?.notes || [])].filter(Boolean)} />
+        </div>
+      )}
+    </>
+  )
+}
+
+/* ── 타점 ─────────────────────────────── */
+
+const gradeOf = (n) =>
+  n == null ? ['s-none', '미산출']
+    : n >= 85 ? ['s-buy', '적극매수']
+    : n >= 70 ? ['s-buy', '매수']
+    : n >= 55 ? ['s-hold', '관망']
+    : ['s-wait', '보류']
+
+function Duplicates({ onDoc }) {
+  const [groups, setGroups] = useState([])
+  useEffect(() => { api.duplicates().then(r => setGroups(r.groups)).catch(() => {}) }, [])
+  if (!groups.length) return null
+  return (
+    <div className="card">
+      <h2>같은 지수 중복 <InfoBtn k="dup" onOpen={onDoc} /></h2>
+      {groups.map(g => (
+        <div key={g.index} style={{ marginBottom: 14 }}>
+          <div className="hint" style={{ marginTop: 0 }}>{g.index}</div>
+          {g.members.map((m, i) => (
+            <div className="picked-row" key={m.ticker}>
+              <span>{i === 0 && <span className="tag bench">추천</span>} {shortLabel(m)}</span>
+              <b className="num">
+                {m.expense_ratio != null ? `보수 ${m.expense_ratio}%` : '보수 미확인'}
+              </b>
+              <span />
+            </div>
+          ))}
+          <div className="hint">{g.advice}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function Screener({ onDoc }) {
+  const [items, setItems] = useState(null)
+  const [market, setMarket] = useState('ALL')
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    api.scores().then(r => setItems(r.items)).catch(e => setErr(e.message))
+  }, [])
+
+  if (err) return <div className="card"><Err msg={err} /></div>
+  if (!items) return <div className="card"><div className="empty">불러오는 중…</div></div>
+
+  const scored = items
+    .filter(i => market === 'ALL' || i.market === market)
+    .sort((a, b) => (b.total ?? -1) - (a.total ?? -1))
+  const withScore = scored.filter(e => e.total != null)
+  const without = scored.filter(e => e.total == null)
+
+  return (
+    <div className="card">
+      <h2>오늘의 매수타점 <InfoBtn k="score" onOpen={onDoc} /></h2>
+      <div className="dir" style={{ marginBottom: 14 }}>
+        {[['ALL', '전체'], ['US', '미국'], ['KR', '국내']].map(([k, t]) => (
+          <button key={k} aria-selected={market === k} onClick={() => setMarket(k)}>{t}</button>
+        ))}
+      </div>
+      {withScore.length === 0 && (
+        <div className="empty">아직 산출된 점수가 없습니다.<br />
+          수집 배치와 점수 계산을 먼저 실행하세요.</div>
+      )}
+      {withScore.map(e => {
+        const g = GRADE(e.total)
+        const [why, warn] = (e.reason || '').split('⚠')
+        // score_snapshot.facts 는 두 형식이 섞여 있다.
+        //   옛 형식  [[항목, 값, 부연, 획득, 만점], ...]        항목표만
+        //   새 형식  {facts:[...], quality, timing, excluded, confidence}
+        // 재계산을 돌리기 전까지는 DB에 옛 형식이 남아 있으므로 둘 다 받아야 한다.
+        //
+        // 이걸 꺼내지 않고 quality/timing/facts 를 그냥 참조하면 ReferenceError 가 나고,
+        // 리액트가 트리를 통째로 버려서 타점 탭이 빈 화면이 된다. 실제로 그랬다.
+        const raw = e.facts
+        const wrapped = raw && !Array.isArray(raw) ? raw : null
+        const facts = Array.isArray(raw) ? raw
+          : Array.isArray(wrapped?.facts) ? wrapped.facts : []
+        const quality = wrapped?.quality ?? null
+        const timing = wrapped?.timing ?? null
+        const excluded = !!wrapped?.excluded
+        const confidence = wrapped?.confidence ?? null
+        return (
+          <div className="etf" key={e.ticker}>
+            <div className={`score ${g.cls}`}><b>{e.total}</b><s>{g.text}</s></div>
+            <div className="etf-main">
+              <div className="tk">{shortLabel(e)}<small>{e.strategy}</small></div>
+              {quality != null && (
+                <div className="axes">
+                  <div className={`axis${excluded ? ' bad' : ''}`}>
+                    <span className="axis-l">상품 품질</span>
+                    <span className="bar-wrap wide">
+                      <span className="bar-fill" style={{ width: `${quality}%` }} />
+                    </span>
+                    <b>{quality}</b>
+                  </div>
+                  <div className="axis">
+                    <span className="axis-l">매수 타점</span>
+                    <span className="bar-wrap wide">
+                      <span className="bar-fill t" style={{ width: `${timing}%` }} />
+                    </span>
+                    <b>{timing}</b>
+                  </div>
+                  <div className="axis-note">
+                    품질 75% + 타점 25%
+                    {confidence != null && confidence < 80 && (
+                      <span className="low-conf"> · 데이터 신뢰도 {confidence}%</span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {facts.length > 0
+                ? <table className="facts">
+                    <tbody>
+                      {facts.map(([k, v, sub, got, max], i) => (
+                        <tr key={i}>
+                          <th>{k}</th>
+                          <td className="fv">{v}</td>
+                          <td className="fs">{sub}</td>
+                          <td className="fp">
+                            <span className="bar-wrap">
+                              <span className="bar-fill"
+                                style={{ width: `${Math.round((got / max) * 100)}%` }} />
+                            </span>
+                            <b>{got}</b><s>/{max}</s>
+                          </td>
+                        </tr>
+                      ))}
+                      <tr className="ftot">
+                        <th>합계</th><td /><td />
+                        <td className="fp"><b>{e.total}</b><s>/100</s></td>
+                      </tr>
+                    </tbody>
+                  </table>
+                : <div className="why">{why?.trim()}</div>}
+              {e.is_covered_call && (
+                <button className="badge" onClick={() => onDoc('cc')}>분배금 ≠ 수익</button>
+              )}
+              {warn && <div className="hint out">{warn.trim()}</div>}
+            </div>
+          </div>
+        )
+      })}
+      {without.length > 0 && (
+        <div className="note">
+          <p>데이터가 없어 점수를 내지 못한 종목 {without.length}개:
+            {' '}{without.map(e => e.ticker).join(', ')}</p>
+          <p>추정값으로 채우지 않고 비워 둡니다.</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* ── 동기화 상태 ──────────────────────── */
+
+const AGO = (iso) => {
+  if (!iso) return '없음'
+  const days = Math.floor((Date.now() - new Date(iso)) / 86400000)
+  return days === 0 ? '오늘' : days === 1 ? '어제' : `${days}일 전`
+}
+
+function SyncStatus({ onChanged }) {
+  const [data, setData] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState('')
+
+  const load = useCallback(() => {
+    api.syncStatus().then(setData).catch(() => setData(null))
+  }, [])
+  useEffect(() => { load() }, [load])
+
+  const pull = async () => {
+    setBusy(true); setMsg('')
+    try {
+      const r = await api.syncToss()
+      setMsg(r.added > 0 ? `${r.added}건을 새로 불러왔습니다.` : '새로운 매수 내역이 없습니다.')
+      load(); onChanged?.()
+    } catch (e) { setMsg(e.message) } finally { setBusy(false) }
+  }
+
+  const toss = data?.items?.find(i => i.source === 'toss')
+  const bad = data?.items?.filter(i => i.state !== 'ok') || []
+
+  return (
+    <div className="card">
+      <h2>토스증권 연동</h2>
+      {bad.length > 0 && (
+        <div className="warn">
+          <b>데이터가 갱신되지 않고 있습니다</b>
+          {bad.map(i => <div key={i.source}>{i.label}: {i.message}</div>)}
+          <div className="hint">아래 숫자는 그 시점 기준이라 지금과 다를 수 있습니다.</div>
+        </div>
+      )}
+      <div className="rows">
+        <div className="row"><span>마지막 동기화</span><b>{AGO(toss?.last_success)}</b></div>
+        <div className="row"><span>자동 실행</span><b>매일 아침 6:30</b></div>
+      </div>
+      <button className="btn" disabled={busy} onClick={pull}>
+        {busy ? '불러오는 중…' : '지금 불러오기'}
+      </button>
+      {msg && <div className="hint">{msg}</div>}
+    </div>
+  )
+}
+
+/* ── 잔고 대조 ────────────────────────── */
+
+function Reconcile({ onDoc, refresh }) {
+  const [data, setData] = useState(null)
+
+  useEffect(() => { api.reconcile().then(setData).catch(() => setData(null)) }, [refresh])
+  if (!data) return null
+  if (!data.available) return (
+    <div className="card">
+      <h2>잔고 대조 <InfoBtn k="recon" onOpen={onDoc} /></h2>
+      <div className="hint">{data.reason}</div>
+    </div>
+  )
+
+  const bad = data.items.filter(i => i.state !== 'ok')
+  return (
+    <div className="card">
+      <h2>잔고 대조 <InfoBtn k="recon" onOpen={onDoc} /></h2>
+      {bad.length === 0
+        ? <div className="rows">
+            <div className="row"><span>증권사 잔고와</span>
+              <b style={{ color: 'var(--in)' }}>일치</b></div>
+          </div>
+        : <div className="warn">
+            <b>{bad.length}종목이 실제 잔고와 다릅니다</b>
+            {bad.map(i => (
+              <div key={i.ticker} style={{ marginTop: 8 }}>
+                {i.ticker} · 기록 {qty(i.booked)}주 / 실제
+                {' '}{i.actual == null ? '없음' : qty(i.actual) + '주'}
+                <div className="hint out">{i.note}</div>
+              </div>
+            ))}
+          </div>}
+      <div className="hint">{data.note}</div>
+    </div>
+  )
+}
+
+/* ── 매수기록 ─────────────────────────── */
+
+const today = () => new Date().toISOString().slice(0, 10)
+
+const PAGE = 30
+
+function Ledger({ etfs, onDoc, onChanged }) {
+  const [items, setItems] = useState([])
+  const [shown, setShown] = useState(PAGE)
+  const [watch, setWatch] = useState(null)
+  const [manual, setManual] = useState(false)
+  const [form, setForm] = useState({ ticker: '', trade_date: today(), qty: '', price: '' })
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      const [p, w] = await Promise.all([api.purchases(), api.watchdog()])
+      setItems(p.items); setWatch(w); setErr('')
+    } catch (e) { setErr(e.message) }
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  const submit = async () => {
+    setBusy(true); setErr('')
+    try {
+      await api.addPurchase({
+        ticker: form.ticker, trade_date: form.trade_date,
+        qty: Number(form.qty), price: uncomma(form.price), account_mode: 'KR_SHELTER',
+      })
+      setForm({ ticker: '', trade_date: today(), qty: '', price: '' })
+      await load(); onChanged?.()
+    } catch (e) { setErr(e.message) } finally { setBusy(false) }
+  }
+
+  const remove = async (id) => {
+    try { await api.delPurchase(id); await load(); onChanged?.() }
+    catch (e) { setErr(e.message) }
+  }
+
+  const ready = form.ticker && form.qty > 0 && form.price > 0
+
+  return (
+    <>
+      <SyncStatus onChanged={() => { load(); onChanged?.() }} />
+      <Reconcile onDoc={onDoc} refresh={items.length} />
+      <div className="card">
+        <button className="fold-head" onClick={() => setManual(!manual)} aria-expanded={manual}>
+          <span>절세계좌 기록 직접 입력</span>
+          <span className="fold-mark">{manual ? '−' : '+'}</span>
+        </button>
+        {manual && <div className="fold-body">
+        <p className="hint">일반계좌는 토스에서 자동으로 들어옵니다.
+          여기는 토스가 주지 않는 절세계좌(ISA·연금) 전용입니다.</p>
+        <div className="grid2" style={{ marginTop: 12 }}>
+          <select value={form.ticker} onChange={e => setForm({ ...form, ticker: e.target.value })}>
+            <option value="">종목 선택</option>
+            {etfs.map(e => <option key={e.ticker} value={e.ticker}>{e.ticker} {e.name}</option>)}
+          </select>
+          <input type="date" value={form.trade_date} max={today()}
+            onChange={e => setForm({ ...form, trade_date: e.target.value })} />
+          <input inputMode="decimal" placeholder="수량" value={form.qty}
+            onChange={e => setForm({ ...form, qty: e.target.value })} />
+          <input inputMode="decimal" placeholder="단가" value={form.price}
+            onChange={e => setForm({ ...form, price: e.target.value })} />
+        </div>
+        <button className="btn" disabled={busy || !ready} onClick={submit}>
+          {busy ? '저장 중…' : '기록 추가'}
+        </button>
+        <Err msg={err} />
+        </div>}
+      </div>
+
+      <div className="card">
+        <h2>매수기록 {items.length}건</h2>
+        {items.length === 0
+          ? <div className="empty">아직 기록이 없습니다.</div>
+          : <table>
+              <tbody>
+                <tr><th>일자</th><th>종목</th><th style={{ textAlign: 'right' }}>수량</th>
+                    <th style={{ textAlign: 'right' }}>단가</th><th /></tr>
+                {items.slice(0, shown).map(p => (
+                  <tr key={p.id}>
+                    <td className="num">{String(p.trade_date).slice(5)}</td>
+                    <td>{p.ticker}</td>
+                    <td className="n">{qty(p.qty)}</td>
+                    <td className="n">{Number(p.price).toLocaleString('ko-KR')}</td>
+                    <td style={{ textAlign: 'right' }}>
+                      <button className="del" onClick={() => remove(p.id)}>삭제</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>}
+        {shown < items.length && (
+          <button className="btn ghost" onClick={() => setShown(shown + PAGE)}>
+            {items.length - shown}건 더 보기
+          </button>
+        )}
+
+        {watch && (
+          <div className={watch.level === 'ok' ? 'note' : 'warn'}>
+            <b>금융소득 워치독 <InfoBtn k="watchdog" onOpen={onDoc} /></b><br />
+            {watch.year}년 누적 {won(watch.gross_krw)}원 / 기준 {won(watch.threshold_krw)}원
+            ({Math.round(watch.ratio * 100)}%)<br />{watch.message}
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
+/* ── 배당예상일지 ─────────────────────── */
+
+const MONTH_LABEL = (y, m) => `${y}.${String(m).padStart(2, '0')}`
+
+function Calendar({ onDoc }) {
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const [open, setOpen] = useState(null)
+
+  useEffect(() => {
+    setData(null); setErr('')
+    api.calendar().then(setData).catch(e => setErr(e.message))
+  }, [])
+
+  if (err) return <div className="card"><Err msg={err} /></div>
+  if (!data) return <div className="card"><div className="empty">불러오는 중…</div></div>
+  if (data.empty) return (
+    <div className="card"><h2>배당예상일지</h2>
+      <div className="empty">{data.message}<br />기록 탭에서 매수 내역을 추가하세요.</div>
+    </div>
+  )
+
+  const max = Math.max(...data.months.map(m => m.net_krw), 1)
+  const total = data.months.reduce((a, m) => a + m.net_krw, 0)
+
+  return (
+    <>
+      <div className="card">
+        <h2>앞으로 12개월 배당 <InfoBtn k="cal" onOpen={onDoc} /></h2>
+        <div className="result" style={{ borderTop: 0, paddingTop: 0, marginTop: 0 }}>
+          <div className="lbl">예상 수령 합계 (세후)</div>
+          <div className="big">{won(total)}원</div>
+        </div>
+        <div className="strip" style={{ marginTop: 14 }}>
+          {data.months.map(m => (
+            <div className="mo" key={`${m.year}-${m.month}`}>
+              <div className={m.all_confirmed ? 'bar' : 'bar est'}
+                style={{ height: `${Math.max(2, (m.net_krw / max) * 100)}%` }} />
+              <b>{m.month}</b>
+            </div>
+          ))}
+        </div>
+        <div className="legend">
+          <span><i style={{ background: 'var(--in)' }} />확정</span>
+          <span><i className="bar est" style={{ height: 9 }} />추정</span>
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>월별 상세</h2>
+        <div className="fold-list">
+        {data.months.map(m => (
+          <div key={`${m.year}-${m.month}`}>
+            <button className="fold-head"
+              aria-expanded={open === `${m.year}${m.month}`}
+              onClick={() => setOpen(open === `${m.year}${m.month}` ? null : `${m.year}${m.month}`)}>
+              <span>{MONTH_LABEL(m.year, m.month)}
+                {!m.all_confirmed && <span className="tag">추정</span>}</span>
+              <b className="num">{won(m.net_krw)}원</b>
+            </button>
+            {open === `${m.year}${m.month}` && (
+              <div className="fold-body">
+                {m.items.map((it, i) => (
+                  <div className="row" key={i}>
+                    <span>{it.pay_date.slice(5)} · {it.ticker}</span>
+                    <b className="num">{won(it.net_krw)}원</b>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+        </div>
+        {data.no_data.length > 0 && (
+          <div className="note">
+            <p>배당 이력이 없어 제외한 종목: {data.no_data.join(', ')}</p>
+          </div>
+        )}
+        <Notes items={data.notes} />
+      </div>
+    </>
+  )
+}
+
+/* ── 알림 설정 ────────────────────────── */
+
+function PushSetting({ onDoc }) {
+  const [state, setState] = useState({ loading: true })
+  const [msg, setMsg] = useState('')
+
+  const refresh = useCallback(async () => {
+    const status = pushStatus()
+    let serverReady = false
+    try { serverReady = (await api.pushKey()).enabled } catch { /* 서버 미설정 */ }
+    const subscribed = status.ok ? await isSubscribed() : false
+    setState({ loading: false, status, serverReady, subscribed })
+  }, [])
+
+  useEffect(() => { refresh() }, [refresh])
+
+  if (state.loading) return null
+
+  const { status, serverReady, subscribed } = state
+
+  const toggle = async () => {
+    setMsg('')
+    try {
+      if (subscribed) { await disablePush(); setMsg('알림을 껐습니다.') }
+      else { await enablePush(); setMsg('알림을 켰습니다.') }
+      await refresh()
+    } catch (e) { setMsg(e.message) }
+  }
+
+  return (
+    <div className="card">
+      <h2>매수 추천 알림 <InfoBtn k="push" onOpen={onDoc} /></h2>
+      {!status.ok && <div className="warn">{status.message}</div>}
+      {status.ok && !serverReady && (
+        <div className="warn">서버에 알림 키가 설정되지 않았습니다.
+          EC2에서 <code>python -m alerts.push --gen-keys</code> 를 실행해 .env 에 넣어주세요.</div>
+      )}
+      {status.ok && serverReady && (
+        <>
+          <div className="row">
+            <span>85점 상향 돌파 시 알림</span>
+            <b>{subscribed ? '켜짐' : '꺼짐'}</b>
+          </div>
+          <button className={subscribed ? 'btn ghost' : 'btn'} onClick={toggle}>
+            {subscribed ? '알림 끄기' : '알림 켜기'}
+          </button>
+          {subscribed && (
+            <button className="btn ghost" onClick={async () => {
+              try { const r = await api.pushTest(); setMsg(`${r.delivered}/${r.subscriptions}건 발송`) }
+              catch (e) { setMsg(e.message) }
+            }}>테스트 알림 보내기</button>
+          )}
+        </>
+      )}
+      {msg && <div className="note"><p>{msg}</p></div>}
+    </div>
+  )
+}
+
+/* ── 대시보드 ─────────────────────────── */
+
+const Signed = ({ v, suffix = '원' }) => (
+  <b className="num" style={{ color: v > 0 ? 'var(--in)' : v < 0 ? 'var(--out)' : undefined }}>
+    {v > 0 ? '+' : ''}{won(v)}{suffix}
+  </b>
+)
+
+function Returns({ onDoc, reloadKey }) {
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    setData(null); setErr('')
+    api.returns().then(setData).catch(e => setErr(e.message))
+  }, [reloadKey])
+
+  if (err) return <div className="card"><Err msg={err} /></div>
+  if (!data || data.empty) return null
+
+  const r = data.result
+  return (
+    <>
+      <div className="card">
+        <h2>총수익 <InfoBtn k="total" onOpen={onDoc} /></h2>
+        <div className="hero">
+          <div className="hero-v" style={{ color: signed(r.total_return_krw).color }}>
+            {signed(r.total_return_krw).text}원
+          </div>
+          <div className="hero-p" style={{ color: signed(r.total_return_krw).color }}>
+            {signedPct(r.total_return_pct)}
+          </div>
+        </div>
+        <div className="hero-sub">
+          {won(r.cost_krw)}원 → {won(r.value_krw)}원
+          {data.accounts?.length > 1 && (
+            <div className="kv" style={{ marginTop: 6 }}>
+              {data.accounts.map(a => (
+                <span key={a.mode}>
+                  {MODES.find(m => m.key === a.mode)?.short || a.mode} {won(a.cost_krw)}원
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="metrics">
+          <div className="metric">
+            <div className="metric-l">시세차익</div>
+            <div className="metric-v" style={{ color: signed(r.price_gain_krw).color }}>
+              {signed(r.price_gain_krw).text}</div>
+          </div>
+          <div className="metric">
+            <div className="metric-l">환차익</div>
+            <div className="metric-v" style={{ color: signed(r.fx_gain_krw).color }}>
+              {signed(r.fx_gain_krw).text}</div>
+          </div>
+          <div className="metric">
+            <div className="metric-l">받은 배당 (세후)</div>
+            <div className="metric-v" style={{ color: 'var(--in)' }}>
+              {signed(r.dividend_net_krw).text}</div>
+            <div className="metric-s">세금 {won(r.dividend_tax_krw)}원 차감</div>
+          </div>
+          <div className="metric">
+            <div className="metric-l">매도 시 양도세</div>
+            <div className="metric-v">
+              {r.estimated_capgain_tax_krw > 0 ? won(r.estimated_capgain_tax_krw) : '없음'}</div>
+            <div className="metric-s">지금 전부 판다고 가정</div>
+          </div>
+        </div>
+        <Notes items={r.notes} />
+      </div>
+
+      <div className="card">
+        <h2>종목별 손익</h2>
+        {r.positions.map(p => (
+          <div className="row-item" key={p.ticker}>
+            <div className="row-main">
+              <div className="tk">{p.ticker}
+                <small>{qty(p.qty)}주 · 평단 {usd(p.avg_price)}</small>
+              </div>
+              <div className="kv">
+                <span>시세 <b style={{ color: signed(p.price_gain_krw).color }}>
+                  {signed(p.price_gain_krw).text}</b></span>
+                <span>환 <b style={{ color: signed(p.fx_gain_krw).color }}>
+                  {signed(p.fx_gain_krw).text}</b></span>
+                <span>배당 <b style={{ color: 'var(--in)' }}>+{won(p.dividend_krw)}</b></span>
+              </div>
+              {p.opening_qty > 0 && (
+                <div className="hint">이 중 {qty(p.opening_qty)}주는 매수 이력이 없어
+                  환차익 계산에서 제외</div>
+              )}
+              {p.price_gain_krw < 0 && p.dividend_krw > -p.price_gain_krw && (
+                <div className="badge">배당이 시세손실을 메움</div>
+              )}
+            </div>
+            <div className="row-right">
+              <b style={{ color: signed(p.total_gain_krw).color }}>{signedPct(p.return_pct)}</b>
+              <s>{signed(p.total_gain_krw).text}원</s>
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  )
+}
+
+function Dashboard({ onDoc, reloadKey }) {
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    setData(null); setErr('')
+    api.portfolio().then(setData).catch(e => setErr(e.message))
+  }, [reloadKey])
+
+  if (err) return <div className="card"><Err msg={err} /></div>
+  if (!data) return <div className="card"><div className="empty">불러오는 중…</div></div>
+  if (data.empty) return (
+    <div className="card"><h2>내 포트폴리오</h2>
+      <div className="empty">{data.message}<br />기록 탭에서 매수 내역을 추가하세요.</div>
+    </div>
+  )
+
+  const r = data.result
+  return (
+    <>
+      <div className="card">
+        <h2>내 포트폴리오 <InfoBtn k="avg" onOpen={onDoc} /></h2>
+        <div className="result" style={{ borderTop: 0, paddingTop: 0, marginTop: 0 }}>
+          <div className="lbl">세후 월평균 배당</div>
+          <div className="big">{won(r.monthly_avg_net_krw)}원</div>
+          <div className="rows">
+            <div className="row"><span>투자 원금</span><b className="num">{won(r.invested_krw)}원</b></div>
+            <div className="row"><span>연 세후 배당</span><b className="num">{won(r.annual_net_krw)}원</b></div>
+            <div className="row"><span>가중 배당률</span><b className="num">{r.weighted_yield_pct}%</b></div>
+          </div>
+        </div>
+        <Notes items={r.notes} />
+      </div>
+      <div className="card">
+        <h2>월별 입금 <InfoBtn k="strip" onOpen={onDoc} /></h2>
+        <MonthStrip values={r.monthly_breakdown} />
+      </div>
+    </>
+  )
+}
+
+/* ── 앱 ───────────────────────────────── */
+
+export default function App() {
+  const [tab, setTab] = useState('home')
+  const [etfs, setEtfs] = useState([])
+  const [doc, setDoc] = useState(null)
+  const [err, setErr] = useState('')
+  const [reloadKey, setReloadKey] = useState(0)
+
+  useEffect(() => {
+    api.etfs().then(r => { setEtfs(r.items); setErr('') })
+      .catch(e => { setErr(e.message); setEtfs([]) })
+  }, [])
+
+  const asof = etfs.find(e => e.price_date)?.price_date
+
+  return (
+    <div className="wrap">
+      <header>
+        <div className="brand"><h1>DivDesk</h1><span>배당ETF 매수검토</span></div>
+        <div className="asof num">
+          {asof ? `데이터 기준 ${asof}` : '수집된 데이터 없음'}
+        </div>
+      </header>
+
+      <nav role="tablist">
+        {[['home', '홈'], ['calc', '계산'], ['proj', '시뮬레이션'],
+          ['score', '타점'], ['ledger', '기록']].map(([k, label]) => (
+          <button key={k} role="tab" aria-selected={tab === k}
+            onClick={() => { setTab(k); window.scrollTo(0, 0) }}>{label}</button>
+        ))}
+      </nav>
+
+
+      <Err msg={err} />
+
+      {tab === 'home' && (
+        <>
+          <Returns onDoc={setDoc} reloadKey={reloadKey} />
+          <Calendar onDoc={setDoc} key={reloadKey} />
+        </>
+      )}
+      {tab === 'calc' && <Calculator etfs={etfs} onDoc={setDoc} />}
+      {tab === 'proj' && <Projection etfs={etfs} onDoc={setDoc} />}
+      {tab === 'score' && (
+        <>
+          <Screener onDoc={setDoc} />
+          <Duplicates onDoc={setDoc} />
+        </>
+      )}
+      {tab === 'ledger' && (
+        <>
+          <Ledger etfs={etfs} onDoc={setDoc}
+            onChanged={() => setReloadKey(k => k + 1)} />
+          <PushSetting onDoc={setDoc} />
+        </>
+      )}
+
+
+      <Sheet docKey={doc} onClose={() => setDoc(null)} />
+    </div>
+  )
+}

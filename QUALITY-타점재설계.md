@@ -1,477 +1,148 @@
-:root{
-  --ink:#0F1E3D;
-  --ink-2:#4A5872;
-  --paper:#E9EDF2;
-  --card:#FFFFFF;
-  --rule:#C8D1DD;
-  --in:#0E6F63;
-  --out:#A63A18;
-  --gold:#8A6D1F;
-  --mono:'JetBrains Mono',ui-monospace,monospace;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-body{
-  background:var(--paper);color:var(--ink);
-  font-family:Pretendard,-apple-system,BlinkMacSystemFont,sans-serif;
-  font-size:16px;line-height:1.55;
-  padding-bottom:calc(84px + env(safe-area-inset-bottom));
-  -webkit-font-smoothing:antialiased;
-}
-.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
-.wrap{max-width:560px;margin:0 auto;padding:0 18px}
+-- DivDesk 스키마 v1  (PostgreSQL 14+)
+-- 원칙: 주가·배당률은 수집값만 저장. 세율은 코드가 아니라 tax_param 테이블.
 
-header{padding:18px 0 12px}
-.brand{display:flex;align-items:baseline;gap:8px}
-.brand h1{font-size:19px;font-weight:800;letter-spacing:-.03em}
-.brand span{font-size:11px;color:var(--ink-2);letter-spacing:.08em}
-.asof{margin-top:5px;font-size:12.5px;color:var(--ink-2)}
+CREATE TABLE IF NOT EXISTS etf_master (
+  ticker          text PRIMARY KEY,            -- 미국:SCHD / 국내:458730
+  market          text NOT NULL CHECK (market IN ('US','KR')),
+  name            text NOT NULL,
+  issuer          text,
+  strategy        text,                        -- 배당성장/고배당/커버드콜/우선주/리츠
+  pay_freq        text CHECK (pay_freq IN ('M','Q','SA','A')),
+  pays_per_year   int,                         -- TTM 합산 횟수 기준 (M=12, Q=4)
+  expense_ratio   numeric(6,4),
+  index_name      text,
+  kr_alt_ticker   text,                        -- 절세계좌 대체종목 매핑
+  is_covered_call boolean DEFAULT false,       -- '분배금 ≠ 수익' 배지 강제
+  is_benchmark    boolean DEFAULT false,       -- 비교 기준. 매수 후보·타점 목록에서 제외
+  tags            jsonb DEFAULT '{}'::jsonb,
+  updated_at      timestamptz DEFAULT now()
+);
 
-.seg{display:flex;border:1px solid var(--ink);border-radius:2px;overflow:hidden;margin-top:12px}
-.seg button{flex:1;padding:13px 6px;font-size:13.5px;font-weight:600;background:transparent;
-  border:0;border-right:1px solid var(--rule);color:var(--ink-2);cursor:pointer;font-family:inherit;
-  min-height:46px}
-.seg button:last-child{border-right:0}
-.seg button[aria-selected=true]{background:var(--ink);color:#fff}
+CREATE TABLE IF NOT EXISTS etf_price_daily (
+  ticker text REFERENCES etf_master(ticker),
+  date   date,
+  close  numeric(18,4) NOT NULL,
+  adj_close numeric(18,4),      -- 분배금 재투자 보정. 총수익률 계산용
+  nav    numeric(18,4),
+  ma200  numeric(18,4),
+  high52 numeric(18,4),
+  low52  numeric(18,4),
+  src    text NOT NULL,
+  PRIMARY KEY (ticker, date)
+);
 
-.card{background:var(--card);border:1px solid var(--rule);border-radius:3px;padding:16px;margin-top:14px}
-.card h2{font-size:13px;font-weight:700;letter-spacing:.1em;color:var(--ink-2);
-  text-transform:uppercase;display:flex;align-items:center;gap:6px;margin-bottom:12px}
+CREATE TABLE IF NOT EXISTS dividend_history (
+  ticker      text REFERENCES etf_master(ticker),
+  ex_date     date,
+  pay_date    date,
+  dps         numeric(18,6) NOT NULL,
+  is_estimate boolean DEFAULT false,
+  src         text NOT NULL,
+  conflict    boolean DEFAULT false,           -- 2개 소스 값 불일치
+  PRIMARY KEY (ticker, ex_date)
+);
 
-.info{width:22px;height:22px;border-radius:50%;border:1px solid var(--rule);
-  background:#fff;color:var(--ink-2);font-size:13px;font-weight:700;line-height:1;
-  cursor:pointer;flex:0 0 auto;font-family:inherit;padding:0}
-.info:hover,.info:focus-visible{background:var(--ink);color:#fff;border-color:var(--ink);outline:none}
+CREATE TABLE IF NOT EXISTS fx_rate (
+  date date PRIMARY KEY,
+  usdkrw numeric(12,4) NOT NULL,
+  src text NOT NULL
+);
 
-label{display:block;font-size:13px;color:var(--ink-2);margin-bottom:5px}
-.field{display:flex;align-items:center;border-bottom:1.5px solid var(--ink);padding-bottom:6px}
-.field input{flex:1;border:0;background:transparent;font-size:24px;font-weight:700;
-  text-align:right;color:var(--ink);outline:none;font-family:var(--mono);min-width:0}
-.field em{font-style:normal;font-size:13px;color:var(--ink-2);padding-left:6px}
-.dir{display:flex;margin-bottom:16px}
-.dir button{flex:1;padding:13px 8px;font-size:14px;font-weight:600;background:#fff;font-family:inherit;
-  border:1px solid var(--rule);color:var(--ink-2);cursor:pointer;min-height:46px}
-.dir button[aria-selected=true]{background:#DDE6E4;border-color:var(--in);color:var(--in)}
+CREATE TABLE IF NOT EXISTS purchase (
+  id bigserial PRIMARY KEY,
+  ticker text REFERENCES etf_master(ticker),
+  trade_date date NOT NULL,
+  qty numeric(18,6) NOT NULL CHECK (qty > 0),
+  price numeric(18,4) NOT NULL,
+  fx_at_buy numeric(12,4),
+  fee numeric(18,4) DEFAULT 0,
+  account_mode text NOT NULL CHECK (account_mode IN ('US_TAXABLE','KR_TAXABLE','KR_SHELTER')),
+  memo text,
+  -- 증권사 API가 주지 않는 과거 보유분. 매수일·환율을 모르므로
+  -- 환차익 계산에서 제외한다. 수량과 원가만 유효하다.
+  is_opening_balance boolean DEFAULT false,
+  created_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_purchase_ticker ON purchase(ticker, trade_date);
 
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.chip{font-size:13.5px;padding:9px 13px;border:1px solid var(--rule);background:#fff;
-  border-radius:2px;cursor:pointer;font-family:inherit;color:var(--ink-2);min-height:40px}
-.chip[aria-pressed=true]{background:#DDE6E4;border-color:var(--in);color:var(--in);font-weight:600}
+CREATE TABLE IF NOT EXISTS score_snapshot (
+  ticker text REFERENCES etf_master(ticker),
+  date date,
+  total int NOT NULL,
+  yield_pctile numeric(6,2),
+  price_pos    numeric(6,2),
+  dps_health   numeric(6,2),
+  total_ret    numeric(6,2),
+  fx_pos       numeric(6,2),
+  exdate_pen   numeric(6,2),
+  reason text,
+  PRIMARY KEY (ticker, date)
+);
 
-.result{margin-top:18px;padding-top:14px;border-top:1px dashed var(--rule)}
-.result .big{font-family:var(--mono);font-size:34px;font-weight:700;
-  letter-spacing:-.02em;color:var(--in);line-height:1.1}
-.result .lbl{font-size:13px;color:var(--ink-2);letter-spacing:.04em;
-  display:flex;align-items:center;gap:6px}
-.rows{margin-top:14px;font-size:14.5px}
-.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px dotted var(--rule)}
-.row:last-child{border-bottom:0}
-.row span:first-child{color:var(--ink-2)}
-.minus{color:var(--out)}
+CREATE TABLE IF NOT EXISTS tax_param (
+  key text PRIMARY KEY,
+  value numeric(14,5) NOT NULL,
+  effective_from date NOT NULL,
+  source_url text,
+  note text
+);
 
-.strip{display:flex;gap:4px;align-items:stretch;height:170px;margin-top:10px;
-  padding:8px 0;border-bottom:2px solid var(--rule)}
-/* .mo 에 height:100% 가 없으면 자식 막대의 height:% 가 기준을 못 찾아
-   아무것도 안 그려진다. 실제로 그 버그가 있었다. */
-.mo{flex:1;height:100%;display:flex;flex-direction:column;
-  justify-content:flex-end;align-items:center;gap:5px;min-width:0}
-.bar{width:100%;background:var(--in);border-radius:3px 3px 0 0;min-height:3px;
-  transition:height .2s}
-.bar.est{background:repeating-linear-gradient(-45deg,#0E6F63,#0E6F63 3px,#7FAEA8 3px,#7FAEA8 6px)}
-.mo b{font-family:var(--mono);font-size:11px;font-weight:500;color:var(--ink-2);flex:0 0 auto}
-.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--ink-2);margin-top:8px}
-.legend i{display:inline-block;width:9px;height:9px;margin-right:4px;vertical-align:-1px}
+-- 원문 보관: 나중에 값이 이상하면 원본과 대조
+CREATE TABLE IF NOT EXISTS raw_snapshot (
+  id bigserial PRIMARY KEY,
+  src text NOT NULL,
+  ticker text,
+  fetched_at timestamptz DEFAULT now(),
+  payload jsonb NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_raw_src_time ON raw_snapshot(src, fetched_at DESC);
 
-.etf{display:flex;gap:12px;padding:13px 0;border-bottom:1px solid var(--rule);align-items:center}
-.etf:last-child{border-bottom:0}
-.score{width:52px;height:52px;flex:0 0 auto;border-radius:2px;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;color:#fff}
-.score b{font-family:var(--mono);font-size:21px;line-height:1}
-.score s{text-decoration:none;font-size:8.5px;letter-spacing:.04em}
-.s-buy{background:var(--in)}.s-hold{background:var(--gold)}.s-wait{background:#7A8598}
-.s-none{background:var(--rule);color:var(--ink-2)}
-.etf-main{flex:1;min-width:0}
-.tk{font-weight:800;font-size:16px;letter-spacing:-.01em}
-.tk small{font-weight:500;font-size:12.5px;color:var(--ink-2);margin-left:6px}
-.why{font-size:12.5px;color:var(--ink-2);margin-top:3px}
-.badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 5px;margin-top:5px;
-  margin-right:4px;border:1px solid var(--out);color:var(--out);border-radius:2px}
-.yld{text-align:right;flex:0 0 auto}
-.yld b{font-family:var(--mono);font-size:16px}
-.yld s{display:block;text-decoration:none;font-size:9.5px;color:var(--ink-2)}
+CREATE TABLE IF NOT EXISTS income_ledger (
+  year int, month int,
+  gross_krw numeric(18,0) DEFAULT 0,
+  tax_krw   numeric(18,0) DEFAULT 0,
+  PRIMARY KEY (year, month)
+);
 
-table{width:100%;border-collapse:collapse;font-size:14px}
-th{text-align:left;font-size:11.5px;letter-spacing:.06em;color:var(--ink-2);font-weight:600;
-  padding:0 0 7px;border-bottom:1px solid var(--ink)}
-td{padding:9px 0;border-bottom:1px dotted var(--rule)}
-td.n{text-align:right;font-family:var(--mono)}
+-- 휴장일 테이블은 두지 않는다. 수집된 시세의 '거래가 있었던 날짜'가 곧 거래일이고,
+-- 평일 중 빠진 날이 휴장일이다. 별도 표를 관리하면 매년 갱신 누락으로 틀어진다.
 
-.warn{margin-top:14px;padding:13px 15px;background:#FBF0EA;border-left:3px solid var(--out);font-size:13.5px}
-.note{margin-top:12px;padding:12px 14px;background:var(--paper);border-left:3px solid var(--ink-2);
-  font-size:13px;color:#28344B}
-.note p{margin-bottom:5px}.note p:last-child{margin-bottom:0}
-.empty{padding:28px 8px;text-align:center;color:var(--ink-2);font-size:14.5px}
+-- 동기화 결과 기록. 화면에서 '언제 마지막으로 성공했는지'를 보여주기 위해 남긴다.
+-- 조용히 멈춘 채 낡은 숫자를 보는 것이 가장 나쁜 실패 방식이다.
+CREATE TABLE IF NOT EXISTS sync_log (
+  id bigserial PRIMARY KEY,
+  source text NOT NULL,            -- toss | us | kr
+  ok boolean NOT NULL,
+  added int DEFAULT 0,
+  message text,
+  ran_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_sync_recent ON sync_log(source, ran_at DESC);
 
-.btn{width:100%;padding:15px;background:var(--ink);color:#fff;border:0;border-radius:2px;
-  font-family:inherit;font-size:15px;font-weight:600;cursor:pointer;margin-top:14px;min-height:50px}
-.btn:disabled{background:var(--rule);color:var(--ink-2);cursor:default}
-.btn.ghost{background:#fff;color:var(--ink);border:1px solid var(--rule)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.grid2 input,.grid2 select{width:100%;padding:12px;min-height:46px;border:1px solid var(--rule);border-radius:2px;
-  font-family:inherit;font-size:15px;background:#fff;color:var(--ink)}
-.del{background:none;border:0;color:var(--out);font-size:13px;padding:8px;cursor:pointer;font-family:inherit;padding:2px}
+CREATE TABLE IF NOT EXISTS push_subscription (
+  id bigserial PRIMARY KEY,
+  endpoint text UNIQUE NOT NULL,
+  payload jsonb NOT NULL,          -- 브라우저가 준 구독 객체 전체
+  user_agent text,
+  enabled boolean DEFAULT true,
+  created_at timestamptz DEFAULT now()
+);
 
+CREATE TABLE IF NOT EXISTS alert_log (
+  id bigserial PRIMARY KEY,
+  ticker text,
+  kind text NOT NULL,              -- score | exdate
+  message text,
+  delivered int DEFAULT 0,
+  fired_at timestamptz DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS ix_alert_recent ON alert_log(ticker, kind, fired_at DESC);
 
-
-.sheet{position:fixed;inset:0;background:rgba(15,30,61,.45);display:flex;align-items:flex-end;z-index:9}
-.sheet-in{background:#fff;width:100%;max-width:460px;margin:0 auto;padding:20px 18px 26px;
-  border-radius:8px 8px 0 0;max-height:80vh;overflow-y:auto}
-.sheet h3{font-size:15px;font-weight:800;margin-bottom:9px}
-.sheet p{font-size:13px;color:#28344B;margin-bottom:9px}
-.sheet code{font-family:var(--mono);font-size:11.5px;background:var(--paper);padding:2px 5px;display:inline-block}
-@media(prefers-reduced-motion:no-preference){.sheet .sheet-in{animation:up .2s ease}}
-@keyframes up{from{transform:translateY(14px)}}
-
-/* 데스크톱: 좁은 컬럼에 갇혀 글자가 작아 보이던 문제. 폭을 넓히고 본문을 키운다. */
-@media (min-width: 768px){
-  body{font-size:17px}
-  .wrap{max-width:720px;padding:0 24px}
-  .card{padding:20px 24px}
-  .result .big{font-size:40px}
-  .rows{font-size:15.5px}
-  .strip{height:130px}
-}
-
-/* ── 접이식 안내 ─────────────────────── */
-/* 매번 같은 세금 설명을 읽게 하면 정작 숫자가 안 보인다. 기본은 접어 둔다. */
-.fold{margin-top:12px;border-top:1px solid var(--rule)}
-.fold-head{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;
-  padding:13px 0;background:none;border:0;font-family:inherit;font-size:13.5px;
-  color:var(--ink-2);cursor:pointer;text-align:left;min-height:46px}
-.fold-mark{font-size:17px;color:var(--ink-2);flex:0 0 auto}
-.fold-body{padding:0 0 12px;font-size:13px;color:#28344B}
-.fold-body p{margin-bottom:7px}
-.fold-body p:last-child{margin-bottom:0}
-.fold-list .fold-head{border-bottom:1px dotted var(--rule)}
-
-/* ── 큰 숫자 ─────────────────────────── */
-.hero{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px}
-.hero-v{font-family:var(--mono);font-size:32px;font-weight:700;letter-spacing:-.02em;
-  line-height:1.15;color:var(--in)}
-.hero-p{font-family:var(--mono);font-size:17px;font-weight:700;color:var(--ink-2)}
-.hero-sub{font-size:13px;color:var(--ink-2);margin-bottom:14px}
-
-/* ── 지표 카드 ───────────────────────── */
-.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}
-.metric{background:var(--paper);border-radius:3px;padding:12px 14px}
-.metric-l{font-size:12.5px;color:var(--ink-2);margin-bottom:5px}
-.metric-v{font-family:var(--mono);font-size:17px;font-weight:700;word-break:break-all}
-.metric-v.big{font-size:22px}
-.metric-s{font-size:11.5px;color:var(--ink-2);margin-top:4px}
-
-/* ── 목록 행 ─────────────────────────── */
-.row-item{display:flex;gap:12px;padding:14px 0;border-bottom:1px solid var(--rule);
-  align-items:flex-start}
-.row-item:last-child{border-bottom:0}
-.row-main{flex:1;min-width:0}
-.row-right{text-align:right;flex:0 0 auto}
-.row-right b{font-family:var(--mono);font-size:16px;display:block}
-.row-right s{display:block;text-decoration:none !important;font-size:11.5px;color:var(--ink-2);margin-top:2px}
-.kv{display:flex;flex-wrap:wrap;gap:10px;font-size:12.5px;color:var(--ink-2);margin-top:5px}
-.kv b{font-family:var(--mono)}
-.hint{font-size:12px;color:var(--ink-2);margin-top:7px;line-height:1.5}
-.hint.out{color:var(--out)}
-
-/* ── 타점 항목표 ─────────────────────── */
-/* 한 덩어리 문장은 훑기 어렵다. 라벨과 값을 나눈다. */
-.facts{margin-top:8px;display:grid;gap:5px}
-.facts div{display:flex;gap:10px;align-items:baseline}
-.facts dt{flex:0 0 62px;font-size:12px;color:var(--ink-2)}
-.facts dd{flex:1;min-width:0;font-size:13px;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}
-.facts dd b{font-family:var(--mono);font-weight:700}
-.facts dd span{font-size:12px;color:var(--ink-2)}
-
-/* ── 종목 선택 목록 ──────────────────── */
-/* 티커만 보여주면 국내 종목은 숫자라 알아볼 수 없다. */
-.picklist{display:grid;gap:8px;margin-top:8px}
-.pick{display:block;width:100%;text-align:left;padding:12px 14px;background:#fff;
-  border:1px solid var(--rule);border-radius:3px;cursor:pointer;font-family:inherit;
-  min-height:56px}
-.pick[aria-pressed=true]{background:#DDE6E4;border-color:var(--in)}
-.pick-name{display:block;font-size:14.5px;font-weight:600;color:var(--ink)}
-.pick-meta{display:block;font-size:12px;color:var(--ink-2);margin-top:3px}
-
-.pick-info{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-.tag{display:inline-block;font-size:11.5px;padding:3px 8px;background:var(--paper);
-  color:var(--ink-2);border-radius:2px;margin-left:6px}
-.tag.warn-tag{background:#FBF0EA;color:var(--out)}
-.tag.bench{background:#E6EDF6;color:#1B3A63}
-
-.picked{margin-top:14px;border-top:1px solid var(--ink);padding-top:6px}
-.picked-row{display:flex;align-items:center;gap:10px;padding:10px 0;
-  border-bottom:1px dotted var(--rule);font-size:14px}
-.picked-row span:first-child{flex:1;min-width:0}
-.picked-row.total{border-bottom:0;font-weight:700;border-top:1px solid var(--rule)}
-
-select{width:100%;padding:12px;min-height:46px;border:1px solid var(--rule);
-  border-radius:2px;font-family:inherit;font-size:15px;background:#fff;color:var(--ink)}
-
-/* <s> 를 보조 수치 표시에 쓰고 있다. 브라우저 기본 취소선을 전부 해제한다. */
-s { text-decoration: none; }
-
-/* ── 탭 ──────────────────────────────── */
-/* 선택 상태를 2px 실선으로만 표시했더니 어디에 있는지 안 보였다.
-   선택된 탭은 배경·글자색·굵기를 모두 바꿔 한눈에 들어오게 한다. */
-nav{
-  position:fixed;bottom:0;left:0;right:0;z-index:20;
-  background:#fff;border-top:2px solid var(--ink);
-  display:flex;gap:0;padding:6px 6px calc(6px + env(safe-area-inset-bottom));
-  box-shadow:0 -4px 16px rgba(15,30,61,.12);
-}
-nav button{
-  flex:1;padding:10px 2px;background:transparent;border:0;border-radius:4px;
-  font-family:inherit;font-size:13px;font-weight:600;color:var(--ink-2);
-  cursor:pointer;min-height:52px;
-  display:flex;align-items:center;justify-content:center;
-  transition:background .12s, color .12s;
-}
-nav button:hover{background:var(--paper);color:var(--ink)}
-nav button[aria-selected=true]{
-  background:var(--ink);color:#fff;font-weight:700;
-}
-
-@media (min-width: 768px){
-  /* 데스크톱은 헤더 아래 상단. 하단 고정은 본문과 어긋나 화면 밖으로 밀린다. */
-  nav{
-    position:sticky;top:0;bottom:auto;
-    max-width:720px;margin:0 auto 20px;
-    border-top:0;border-bottom:2px solid var(--ink);
-    border-radius:0 0 6px 6px;
-    box-shadow:0 4px 14px rgba(15,30,61,.08);
-    padding:6px;
-  }
-  nav button{font-size:14.5px;min-height:48px}
-  body{padding-bottom:40px}
-}
-
-/* ── 선택 가능한 것들 공통 ────────────── */
-/* 방향 전환·시장 필터·기간 선택은 전부 같은 규칙으로 보인다.
-   선택되면 배경이 채워지고 글자가 진해진다. */
-.dir{display:flex;gap:6px;margin-bottom:16px;background:var(--paper);
-  padding:5px;border-radius:5px}
-.dir button{
-  flex:1;padding:12px 8px;font-size:14px;font-weight:600;
-  background:transparent;border:0;border-radius:4px;
-  color:var(--ink-2);cursor:pointer;font-family:inherit;min-height:46px;
-  transition:background .12s, color .12s;
-}
-.dir button:hover{background:#fff;color:var(--ink)}
-.dir button[aria-selected=true]{
-  background:var(--in);color:#fff;font-weight:700;
-  box-shadow:0 1px 3px rgba(14,111,99,.3);
-}
-
-.chip{
-  font-size:13.5px;padding:10px 14px;border:1.5px solid var(--rule);background:#fff;
-  border-radius:4px;cursor:pointer;font-family:inherit;color:var(--ink-2);
-  min-height:44px;font-weight:500;transition:all .12s;
-}
-.chip:hover{border-color:var(--ink-2);color:var(--ink)}
-.chip[aria-pressed=true]{
-  background:var(--in);border-color:var(--in);color:#fff;font-weight:700;
-}
-
-.pick{
-  display:block;width:100%;text-align:left;padding:14px 16px;background:#fff;
-  border:1.5px solid var(--rule);border-radius:5px;cursor:pointer;
-  font-family:inherit;min-height:60px;transition:all .12s;
-}
-.pick:hover{border-color:var(--ink-2);background:var(--paper)}
-.pick[aria-pressed=true]{
-  background:#DDE6E4;border-color:var(--in);border-width:2px;
-}
-.pick[aria-pressed=true] .pick-name{color:var(--in);font-weight:700}
-
-/* 카드 사이 구분 — 얇은 선 대신 여백과 그림자로 나눈다 */
-.card{
-  background:var(--card);border:1px solid var(--rule);border-radius:6px;
-  padding:18px 20px;margin-top:16px;
-  box-shadow:0 1px 3px rgba(15,30,61,.04);
-}
-.card h2{
-  font-size:13px;font-weight:700;letter-spacing:.08em;color:var(--ink-2);
-  text-transform:uppercase;display:flex;align-items:center;gap:7px;
-  margin:0 0 14px;padding-bottom:12px;border-bottom:2px solid var(--paper);
-}
-
-/* ── 입력 요소 ───────────────────────── */
-select{
-  width:100%;padding:13px 14px;min-height:50px;
-  border:1.5px solid var(--rule);border-radius:5px;
-  font-family:inherit;font-size:15px;background:#fff;color:var(--ink);
-  cursor:pointer;
-}
-select:focus{border-color:var(--in);outline:2px solid rgba(14,111,99,.15)}
-
-.field{
-  display:flex;align-items:center;background:var(--paper);
-  border:1.5px solid transparent;border-radius:5px;padding:4px 14px;
-}
-.field:focus-within{border-color:var(--in);background:#fff}
-.field input{
-  flex:1;border:0;background:transparent;font-size:26px;font-weight:700;
-  text-align:right;color:var(--ink);outline:none;
-  font-family:var(--mono);min-width:0;padding:10px 0;
-}
-.field em{font-style:normal;font-size:15px;color:var(--ink-2);padding-left:8px;font-weight:600}
-
-.grid2 input{
-  width:100%;padding:13px;min-height:50px;border:1.5px solid var(--rule);
-  border-radius:5px;font-family:inherit;font-size:15px;background:#fff;color:var(--ink);
-}
-.grid2 input:focus{border-color:var(--in);outline:2px solid rgba(14,111,99,.15)}
-
-/* ── 목록 구분 ───────────────────────── */
-/* 점선·1px 실선은 화면에서 거의 안 보인다. 여백과 배경으로 나눈다. */
-.row-item{
-  display:flex;gap:14px;padding:16px 0;align-items:flex-start;
-  border-bottom:2px solid var(--paper);
-}
-.row-item:last-child{border-bottom:0;padding-bottom:0}
-
-.etf{
-  display:flex;gap:14px;padding:16px 0;align-items:flex-start;
-  border-bottom:2px solid var(--paper);
-}
-.etf:last-child{border-bottom:0;padding-bottom:0}
-
-.row{
-  display:flex;justify-content:space-between;gap:12px;
-  padding:11px 0;border-bottom:1px solid var(--paper);
-}
-.row:last-child{border-bottom:0}
-
-.picked-row{
-  display:flex;align-items:center;gap:12px;padding:12px 0;
-  border-bottom:2px solid var(--paper);font-size:14.5px;
-}
-.picked-row:last-child{border-bottom:0}
-.picked-row.total{
-  border-bottom:0;font-weight:700;border-top:2px solid var(--ink);margin-top:4px;
-}
-
-/* 접이식 머리 — 누를 수 있다는 게 보여야 한다 */
-.fold-head{
-  width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px;
-  padding:14px 12px;margin:0 -12px;background:transparent;border:0;border-radius:5px;
-  font-family:inherit;font-size:14px;color:var(--ink-2);cursor:pointer;
-  text-align:left;min-height:50px;transition:background .12s;
-}
-.fold-head:hover{background:var(--paper);color:var(--ink)}
-.fold-head[aria-expanded=true]{background:var(--paper);color:var(--ink);font-weight:600}
-.fold-mark{font-size:20px;color:var(--ink-2);flex:0 0 auto;line-height:1}
-.fold{margin-top:14px;border-top:2px solid var(--paper);padding-top:4px}
-.fold-body{padding:10px 0 14px;font-size:13.5px;color:#28344B;line-height:1.6}
-.fold-list{margin-top:16px}
-.fold-list .fold-head{border-bottom:2px solid var(--paper);border-radius:0;margin:0}
-
-/* 지표 카드 — 배경으로 구획을 만든다 */
-.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}
-.metric{background:var(--paper);border-radius:5px;padding:14px 16px}
-.metric-l{font-size:12.5px;color:var(--ink-2);margin-bottom:6px;font-weight:500}
-.metric-v{font-family:var(--mono);font-size:18px;font-weight:700;word-break:break-all}
-.metric-s{font-size:12px;color:var(--ink-2);margin-top:5px}
-
-/* ── 타점 항목표 ─────────────────────── */
-/* 문장 나열은 훑기 어렵다. 항목·값·점수를 열로 나누고
-   막대로 만점 대비 비율을 보여준다. 합계가 총점과 맞는지 눈으로 검산된다. */
-table.facts{width:100%;border-collapse:collapse;margin-top:10px;font-size:13.5px}
-table.facts th{
-  text-align:left;font-size:12.5px;font-weight:600;color:var(--ink-2);
-  padding:8px 10px 8px 0;white-space:nowrap;border:0;width:76px;
-}
-table.facts td{padding:8px 10px 8px 0;border:0;vertical-align:middle}
-table.facts tr{border-bottom:1px solid var(--paper)}
-table.facts tr:last-child{border-bottom:0}
-.facts .fv{font-family:var(--mono);font-weight:700;white-space:nowrap;width:96px}
-.facts .fs{font-size:12px;color:var(--ink-2);line-height:1.4}
-.facts .fp{text-align:right;white-space:nowrap;width:112px}
-.facts .fp b{font-family:var(--mono);font-size:14px;font-weight:700}
-.facts .fp s{text-decoration:none;font-size:11.5px;color:var(--ink-2)}
-.bar-wrap{
-  display:inline-block;width:44px;height:7px;background:var(--rule);
-  border-radius:4px;overflow:hidden;margin-right:8px;vertical-align:middle;
-}
-.bar-fill{display:block;height:100%;background:var(--in);border-radius:4px}
-table.facts tr.ftot{border-top:2px solid var(--ink);border-bottom:0}
-table.facts tr.ftot th{padding-top:11px;color:var(--ink);font-weight:700}
-table.facts tr.ftot .fp{padding-top:11px}
-table.facts tr.ftot .fp b{font-size:17px;color:var(--in)}
-.bar.zero{background:var(--rule)}
-
-/* 막대 위 금액(만원). 높이만으로는 크기를 가늠하기 어렵다. */
-.mo-v{
-  font-family:var(--mono);font-style:normal;font-size:11px;font-weight:700;
-  color:var(--in);flex:0 0 auto;margin-bottom:3px;line-height:1;
-}
-.bar.est{background:repeating-linear-gradient(-45deg,
-  var(--in),var(--in) 4px,#7FAEA8 4px,#7FAEA8 8px)}
-.legend i.sw{display:inline-block;width:10px;height:10px;background:var(--in);
-  border-radius:2px;margin-right:5px;vertical-align:-1px}
-.legend i.sw.est{background:repeating-linear-gradient(-45deg,
-  var(--in),var(--in) 3px,#7FAEA8 3px,#7FAEA8 6px)}
-.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;
-  color:var(--ink-2);margin-top:10px}
-
-/* ── 상품 품질 / 매수 타점 ───────────── */
-/* "무엇을 살까" 와 "언제 살까" 는 다른 질문이다. 하나로 합치면
-   좋은 상품이 비쌀 때도 높게 나와 판단이 흐려진다. */
-.axes{margin:10px 0 4px;padding:12px 14px;background:var(--paper);border-radius:5px}
-.axis{display:flex;align-items:center;gap:10px;margin-bottom:8px}
-.axis:last-of-type{margin-bottom:0}
-.axis-l{flex:0 0 62px;font-size:12.5px;color:var(--ink-2);font-weight:600}
-.axis b{font-family:var(--mono);font-size:15px;font-weight:700;
-  flex:0 0 30px;text-align:right}
-.axis.bad b{color:var(--out)}
-.bar-wrap.wide{flex:1;width:auto;height:9px}
-.bar-fill.t{background:#4A6FA5}
-.axis-note{font-size:11.5px;color:var(--ink-2);margin-top:9px;
-  padding-top:8px;border-top:1px solid var(--rule)}
-
-/* 데이터가 비어 중립 처리된 항목이 많으면 점수를 믿기 어렵다.
-   그 사실을 점수 옆에 드러낸다. 숨기면 빈 데이터가 평균 점수로 둔갑한다. */
-.low-conf{color:var(--out);font-weight:600}
-
-/* 데이터 신뢰도. 비어 있는 항목이 있으면 그 사실을 숫자 옆에 밝힌다. */
-.conf{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:3px;
-  background:var(--rule);color:var(--ink-2);font-size:11.5px;font-weight:600}
-.conf.bad{background:#FBF0EA;color:var(--out)}
-
-/* 담은 종목 줄 안의 금액 입력.
-   .field 는 화면 폭을 쓰는 큰 입력이라 줄 안에 그대로 넣으면 레이아웃이 깨진다.
-   종목별로 얼마씩 넣을지 나란히 비교하며 고칠 수 있어야 해서 줄마다 입력을 둔다. */
-.field.inline{
-  flex:0 0 auto;width:150px;padding-bottom:2px;border-bottom-width:1.5px;
-  background:transparent;
-}
-.field.inline input{
-  font-size:15px;font-weight:700;text-align:right;padding:2px 0;
-}
-.field.inline em{font-size:12px;padding-left:4px}
-.picked-row.amt-row span:first-child{flex:1;min-width:0}
-
-/* 추종 지수 한 줄. 개별 보유 종목은 수집하지 않으므로 '무엇을 담는 상품인가'는
-   지수명으로 답한다. 보조 정보라 한 단계 더 흐리게 둔다. */
-.pick-idx{display:block;font-size:11.5px;color:var(--ink-2);opacity:.75;margin-top:2px}
-
-/* 적립 기간 — 연 + 개월 직접 입력. 5년 단위 버튼만 두면 '3년 6개월' 을 못 고른다.
-   자주 쓰는 값은 옆에 빠른 선택으로 남겨 둔다. */
-.period{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.period .field.inline{width:92px}
-.period-quick{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
-.period-quick button{
-  border:1.5px solid var(--rule);background:transparent;border-radius:4px;
-  padding:5px 10px;font-size:12.5px;font-weight:600;color:var(--ink-2);cursor:pointer;
-}
-.period-quick button[aria-selected="true"]{
-  border-color:var(--ink);background:var(--ink);color:#fff;
-}
+INSERT INTO tax_param(key,value,effective_from,source_url,note) VALUES
+ ('us_withholding',       0.15,     '2026-01-01','https://www.irs.gov','미국 배당 원천징수 15% (한미조세조약)'),
+ ('kr_dividend_tax',      0.154,    '2026-01-01','https://taxcalc.co.kr/stocks/dividend.html','소득세 14% + 지방소득세 1.4%'),
+ ('kr_capgain_overseas',  0.22,     '2026-01-01','https://taxcalc.co.kr','해외상장 양도세 22%, 분리과세'),
+ ('overseas_deduction',   2500000,  '2026-01-01',NULL,'해외 양도차익 연 기본공제'),
+ ('fin_income_threshold', 20000000, '2026-01-01',NULL,'금융소득종합과세 기준'),
+ ('watchdog_ratio',       0.80,     '2026-01-01',NULL,'기준의 80% 도달 시 경고')
+ON CONFLICT (key) DO NOTHING;

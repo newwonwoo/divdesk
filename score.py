@@ -1,260 +1,282 @@
-# 품질확인서 — 스코어 백테스트 (as-of 채점기)
+"""배당 캘린더 엔진.
 
-작성일 2026-08-02 · 대상 커밋: `engine/asof.py`, `scripts/backtest.py`,
-`scripts/bt_report.py`, `scripts/bt_price.py`, `api/main.py`(recompute 전환, 미배포)
+공휴일 테이블을 손으로 채우지 않는다. 이미 수집한 시세의 '거래가 있었던 날짜'가
+곧 거래일이고, 평일 중 빠진 날이 휴장일이다. 실측으로 2026년 한국 휴장일
+10일(설연휴·삼일절 대체·부처님오신날·지방선거일 등)이 정확히 도출되는 것을 확인했다.
+별도 공휴일 데이터를 관리하면 매년 갱신 누락으로 틀리지만, 이 방식은 시세를
+수집하는 한 저절로 맞는다.
 
----
+미래 거래일은 관측 범위를 넘어가므로 주말만 제외하고 추정하며,
+그렇게 만든 날짜는 전부 estimated 로 표시한다.
 
-## 1. 무엇을 하려고 했나
+시장별 규칙이 다르다:
+  US  ex-date 기준. ex-date 전일까지 매수해야 수령. 지급은 ex + 영업일 며칠 뒤.
+  KR  지급기준일 기준. 분배락일 = 지급기준일 직전 영업일, 실제 지급은 익월 초.
+      연휴가 끼면 분배락과 지급 사이가 최대 1주까지 벌어진다.
+"""
+from __future__ import annotations
 
-지금까지 스코어 로직을 여러 번 고쳤지만 **실제로 나은지 검증한 적이 없었다.**
-과거 시점으로 돌아가 그 시점 데이터만으로 점수를 내고, 이후 실제 수익과
-맞춰보는 것이 이번 작업의 목적이다. 특히 **타점(매수 타이밍)** 이 진짜 예측력을
-가지는지가 핵심 질문이었다. 품질은 과거 성과로 계산하므로 미래 성과와 상관이
-나오는 것이 당연할 수 있다(순환 논리).
+import statistics
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 
-## 2. 요구사항 대조표
+# 배당락 → 지급일 사이 영업일 수. 실제 공시가 없을 때만 쓰는 추정값.
+PAY_LAG_BUSINESS_DAYS = {"US": 4, "KR": 12}
 
-| # | 요구사항 | 결과 | 근거 |
-|---|---|---|---|
-| 1 | 과거 시점에서 알 수 있던 정보만 사용 | 충족 | `engine/asof.py` 전 창을 `≤ as_of` 로 절단. `scripts/test_asof.py` 가 "미래를 잘라내도 점수 불변" 을 검증 |
-| 2 | 프로덕션과 같은 채점기로 검증 | 충족 | 조립을 `engine/asof.build_input()` 한 곳으로 모으고 `recompute()` 도 이 경로를 쓰도록 전환 |
-| 3 | 타점 검증을 우선 | 충족 | 동일종목 내 비교(품질 교란 제거) + 횡단면 분위 + 순수 가격위치 확장 검증 |
-| 4 | 시장 국면별 분리 | 충족 | 벤치 200일선 기울기 부호로 up/down 분리. 커버드콜 별도 집계 |
-| 5 | 무단 절단 금지 | 충족 | 미래 구간 부족분은 값만 공란 처리하고 **건수를 출력** |
-| 6 | 품질 축 검증 | **미충족** | 배당 이력이 2020년부터라 과거 시점에서 3·5년 CAGR 재구성 불가 (5절) |
-| 7 | 배당락 낙폭 항목 검증 | **미충족** | `etf_price_daily` 에 `open` 컬럼이 없어 낙폭 산출 불가 → 전 구간 중립 처리 |
 
-## 3. 검증 4단계 결과
+@dataclass
+class TradingCalendar:
+    """관측된 거래일 집합. market 별로 하나씩 만든다."""
+    market: str
+    days: list = field(default_factory=list)      # 정렬된 date 목록
+    _set: set = field(default_factory=set, repr=False)
 
-`make verify` 전 단계 통과 (문법 / import / 목 실행 / pyflakes 지적 0건).
-추가로 `scripts/test_asof.py` 를 새로 만들어 **look-ahead 차단**을 단위 검증했다.
-합성 시계열로 D 이후를 잘라낸 패널과 전체 패널의 채점 결과가 종합·품질·타점
-모두 일치함을 확인했다. 이것이 이 작업에서 가장 중요한 안전장치다 —
-미래를 훔쳐보면 어떤 점수든 예측력이 있는 것처럼 보이기 때문이다.
+    @classmethod
+    def from_dates(cls, market: str, dates: list) -> "TradingCalendar":
+        clean = sorted({d for d in dates if d})
+        return cls(market=market, days=clean, _set=set(clean))
 
-## 4. 실측 결과
+    @property
+    def last_observed(self):
+        return self.days[-1] if self.days else None
 
-### 4-1. 전체 스코어 (2016~2026, 관측 1,505 / 31종, 12개월 수익)
+    def is_trading_day(self, day: date) -> bool:
+        """관측 범위 안이면 실제 거래 여부, 밖이면 주말만 제외한 추정."""
+        if self.days and self.days[0] <= day <= self.days[-1]:
+            return day in self._set
+        return day.weekday() < 5
 
-| 구분 | 최상위−최하위 분위 | 상관 | 동일종목 내 |
-|---|---|---|---|
-| 타점 | +4.6% | +0.196 | **+0.0%** (양 17/28종) |
-| 종합 | +8.8% | +0.206 | — |
+    def is_estimated(self, day: date) -> bool:
+        return not self.days or day > self.days[-1]
 
-벤치(SPY·VOO·QQQ) 12개월 평균 **+15.7%** 로, 후보의 어느 타점 분위보다 높다.
+    def add_business_days(self, start: date, n: int) -> date:
+        """거래일 기준으로 n일 뒤. 휴장일은 건너뛴다."""
+        day, moved = start, 0
+        guard = 0
+        while moved < n and guard < 400:
+            day += timedelta(days=1)
+            guard += 1
+            if self.is_trading_day(day):
+                moved += 1
+        return day
 
-### 4-2. 순수 가격위치 확장 (2017~2026, 관측 2,372 / 31종)
+    def prev_business_day(self, day: date) -> date:
+        cur, guard = day - timedelta(days=1), 0
+        while guard < 30 and not self.is_trading_day(cur):
+            cur -= timedelta(days=1)
+            guard += 1
+        return cur
 
-배당 게이트를 우회해 2018 조정·2020 급락을 포함시킨 검증이다.
+    def holidays_in(self, year: int) -> list:
+        """관측 범위 안에서 평일인데 거래가 없던 날 = 휴장일."""
+        if not self.days:
+            return []
+        out, day = [], max(self.days[0], date(year, 1, 1))
+        end = min(self.days[-1], date(year, 12, 31))
+        while day <= end:
+            if day.weekday() < 5 and day not in self._set:
+                out.append(day)
+            day += timedelta(days=1)
+        return out
 
-| 항목 | 값 |
-|---|---|
-| 5분위 최상위−최하위 | **-2.4%** (단조 아님, U자) |
-| 상관 | **-0.051** |
-| 동일종목 내 | **-3.3%** (양 10/29종) |
-| 국면 up | +0.6% |
-| 국면 down | **-3.1%** |
-| 커버드콜 | -0.9% |
-| 벤치 baseline | +17.2% |
 
-### 4-3. 가격위치 3요소 분해 (2017~2026, 관측 2,372 / 31종)
+@dataclass
+class PredictedPayout:
+    ticker: str
+    ex_date: date
+    pay_date: date
+    dps: float
+    confirmed: bool               # 실제 공시된 분배금인지
+    ex_estimated: bool            # 배당락일이 추정인지
+    pay_estimated: bool           # 지급일이 추정인지
+    basis: str                    # 추정 근거 한 줄
 
-배점 기준. 양(+)이면 그 항목이 점수를 옳은 방향으로 주고 있다는 뜻.
 
-| 항목 | 배점 | 성격 | 상관 | 동일종목차 | 양(+) 종목 | 판정 |
-|---|---|---|---|---|---|---|
-| 200일선 기울기 | 8 | 추세추종 | -0.238 | -12.9% | 2/29 | **방향 반대** |
-| 고점 낙폭 | 6 | 역추세 | +0.310 | +13.2% | 28/29 | **방향 맞음** |
-| 20일 변동 | 6 | 역추세 | -0.008 | +3.0% | 25/29 | 약함·비단조 |
+def _median_interval(dates: list) -> float | None:
+    if len(dates) < 3:
+        return None
+    recent = sorted(dates)[-13:]
+    gaps = [(recent[i + 1] - recent[i]).days for i in range(len(recent) - 1)]
+    return statistics.median(gaps) if gaps else None
 
-두 항목 모두 5분위가 단조다. 낙폭은 최상위 +20.8% → 고점 근처 +6.3%,
-기울기는 하락추세 +17.9% → 상승추세 +8.1% 로 **역방향** 단조.
-20일 변동은 U자(양극단이 좋고 중간이 나쁨)라 선형 배점으로 담기지 않는다.
 
-### 4-4. 낙폭 정규화 3방식 + 기간 분할 (2017~2026, 관측 1,661 / 29종)
+def _trend_dps(amounts: list) -> float:
+    """다음 분배금 추정. 최근 값들의 평균에 추세를 살짝 반영한다.
 
-낙폭 배점의 `-10%` 절대 기준을 '자기 이력 대비' 로 바꾸는 두 안을 현행과 비교.
-값이 클수록 많이 빠진 상태이며, 양(+)이면 그때 사는 게 나았다는 뜻.
+    커버드콜은 분배금 변동이 크므로 추세를 과하게 밀지 않는다 —
+    최근 4회 평균을 기준으로 두고 앞뒤 6개월 평균의 차이만 절반 반영.
+    """
+    if not amounts:
+        return 0.0
+    recent = amounts[-4:]
+    base = sum(recent) / len(recent)
+    if len(amounts) >= 8:
+        older = amounts[-8:-4]
+        drift = (base - sum(older) / len(older)) * 0.5
+        return max(0.0, base + drift)
+    return base
 
-| 방식 | 전체 상관 | 동일종목차 | 양(+) | ~2021 | 2022~ |
-|---|---|---|---|---|---|
-| A 현행 (-10% 만점) | +0.319 | +13.2% | 23/23 | **+0.566** | **+0.022** |
-| B 최대낙폭 대비 | +0.306 | +11.1% | 22/23 | +0.450 | +0.121 |
-| C 낙폭 백분위 | +0.313 | +11.7% | 22/23 | +0.560 | +0.019 |
 
-국면별 상관 — 상승장: A +0.357 / B +0.314 / C +0.339,
-하락장: A +0.297 / B +0.377 / C +0.416.
+def _add_months(anchor: date, months: int, day_of_month: int) -> date:
+    """달력 월 단위로 이동. 말일이 없는 달은 그 달의 마지막 날로 맞춘다."""
+    total = anchor.month - 1 + months
+    year = anchor.year + total // 12
+    month = total % 12 + 1
+    last_day = (date(year + (month // 12), month % 12 + 1, 1) - timedelta(days=1)).day
+    return date(year, month, min(day_of_month, last_day))
 
-종목별 관측 최대낙폭: DIV -54%, VNQ -43%, SPHD -42% ↔ 446720·458730·402970 -14%.
 
-**기간 안정성 검증 실패.** 세 방식 모두 2022년 이후 상관이 0 부근으로 무너진다.
-전체 +0.31 은 사실상 2021년 이전(2020 코로나 급락과 V자 회복)이 만든 값이다.
-부호는 두 기간 모두 양(+)으로 유지돼 방향이 반대였던 기울기와는 다르지만,
-**강도를 신뢰할 수 없다.**
+def _month_step(interval_days: float) -> int | None:
+    """지급 간격을 달 수로 환산. 월/분기/반기/연만 인정한다."""
+    for months, days in ((1, 30.4), (3, 91.3), (6, 182.6), (12, 365.0)):
+        if abs(interval_days - days) <= days * 0.15:
+            return months
+    return None
 
-세 방식의 우열은 가릴 수 없다(0.306~0.319, 노이즈 범위). 성능이 같으므로
-선택은 원칙 문제가 된다 — A 는 하드코딩된 절대 기준이라 종목별로 불공평하다
-(같은 -10% 가 DIV 에겐 일상, 국내 신규 상장에겐 역대급).
 
-**단, B·C 에는 새 위험이 있다.** 최소 낙폭 3종이 모두 국내 2022~23년 상장으로,
--14% 는 저변동이 아니라 **아직 위기를 겪지 않았다**는 뜻이다. B 는 그 -14% 를
-만점 기준으로 삼아 평범한 조정에 만점을 준다. 현재 최소 이력 요건 1년
-(`MIN_DD_HISTORY=252`)은 부족하며, 3년 이상으로 올리거나 이력이 짧으면
-중립 처리해야 한다.
+def _trading_day_in_month(target: date, calendar: TradingCalendar) -> date:
+    """휴장일이면 **같은 달 안에서** 가장 가까운 거래일로 옮긴다.
 
-### 4-5. 환율 밴드 (원화 환산 수익)
+    달을 넘겨 버리면 어떤 달은 지급 0건, 어떤 달은 2건이 되어 일지가 틀어진다.
+    앞으로 당기는 걸 우선하되, 그러면 이전 달로 넘어가는 경우(월초 지급)만
+    뒤로 미룬다.
+    """
+    if calendar.is_trading_day(target):
+        return target
+    back = calendar.prev_business_day(target)
+    if back.month == target.month and back.year == target.year:
+        return back
+    forward = calendar.add_business_days(target - timedelta(days=1), 1)
+    return forward
 
-앞선 검증은 forward 수익을 달러 기준으로 재서 환율 항목이 **평가에서 아예
-빠져 있었다**(영향을 줄 수 없는 결과로 평가). 원화 환산으로 다시 쟀다.
 
-| 밴드 | 상관 | 표본 |
-|---|---|---|
-| 3년 | +0.440 | 월말 22개 (2023-11~2025-08) |
-| 5년 | +0.249 | 월말 3~4개 (n64) |
+def predict_schedule(ticker: str, market: str, history: list,
+                     calendar: TradingCalendar, months: int = 12,
+                     today: date | None = None) -> list[PredictedPayout]:
+    """과거 배당 이력에서 앞으로 months 개월의 지급 일정을 만든다.
 
-**둘 다 검증 불가로 판단한다.** 5년 밴드는 fx 이력이 2021-08 부터라 5년이 쌓인
-시점이 방금 왔고, 거기서 12개월 앞을 보려면 미래가 필요하다. 3년 밴드 +0.440 도
-실질 독립 관측이 두어 개이며, 해당 기간 원화가 일관되게 약세여서 예측이라기보다
-**추세를 되읽은 값**에 가깝다. 원화가 강세로 돌면 부호가 뒤집힌다.
-환율 신호는 같은 날 전 종목이 동일하므로 종목 수(n503)는 표본을 늘려주지 않는다.
+    history: [(ex_date, dps, pay_date|None), ...]  ex_date 오름차순
+    """
+    today = today or date.today()
+    horizon = today + timedelta(days=int(months * 30.5))
+    out: list[PredictedPayout] = []
 
-### 4-6. 낙폭 혼합안 + 기울기 기간 분할 (관측 1,661 / 29종)
+    # 이미 공시된 미래 배당은 그대로 확정 처리
+    for ex_date, dps, pay_date in history:
+        if ex_date > today:
+            resolved = pay_date or calendar.add_business_days(
+                ex_date, PAY_LAG_BUSINESS_DAYS.get(market, 5))
+            out.append(PredictedPayout(
+                ticker, ex_date, resolved, float(dps), True, False,
+                pay_date is None, "공시된 배당락일"))
 
-A(절대)와 C(자기 이력 백분위)를 혼합해 서로의 실패 모드를 막는 안을 검증했다.
-전제인 **A↔C 상관은 +0.898** — 0.95 미만이라 혼합이 무의미하진 않으나
-대부분 같은 신호다.
+    past = [(d, float(a)) for d, a, _ in history if d <= today]
+    if not past:
+        return out
 
-| 방식 | 전체 | 동일종목차 | 양(+) | ~2021 | 2022~ |
-|---|---|---|---|---|---|
-| A 절대 | +0.319 | +13.2% | 23/23 | +0.566 | +0.022 |
-| C 백분위 | +0.313 | +11.7% | 22/23 | +0.560 | +0.019 |
-| D 평균 | +0.325 | +12.5% | 23/23 | +0.573 | +0.021 |
-| **D 최소** | **+0.342** | +12.7% | 22/23 | +0.578 | **+0.035** |
+    interval = _median_interval([d for d, _ in past])
+    if interval is None:
+        return out
 
-D최소가 가장 높으나 개선폭(+0.319→+0.342)은 노이즈 범위이며,
-**2022년 이후 붕괴는 해소되지 않았다**(0.02~0.04). 예상대로 혼합은
-예측력을 살리지 못했다.
+    amounts = [a for _, a in past]
+    estimate = round(_trend_dps(amounts), 6)
+    anchor = max([p.ex_date for p in out] + [past[-1][0]])
 
-**4-4 에서 제기한 C 의 약점은 실측에서 확인되지 않았고, 오히려 A 가
-더 나쁜 문제를 갖고 있었다.** 이력 짧은 관측에서 만점(0.95+) 비율은
-**A 33% / C 10% / D최소 10%** 다. A 는 하드코딩된 -10% 상한 때문에
--10% 든 -30% 든 전부 1.0 으로 뭉개, 세 관측 중 하나꼴로 변별력을 잃는다.
+    # 월배당을 30일 간격으로 더하면 1년에 약 5일씩 앞당겨져, 결국 한 달에
+    # 두 번 잡히는 가짜 일정이 생긴다. 달력 월 단위로 옮겨야 실제와 맞는다.
+    step_months = _month_step(interval)
+    day_of_month = anchor.day
+    basis = (f"과거 {len(past)}회 이력, "
+             + (f"{step_months}개월 주기" if step_months else f"평균 간격 {interval:.0f}일")
+             + ", 최근 4회 평균 기준 추정")
 
-**단, 이력 길이 분리 자체에 결함이 있다.** `hist_years` 를 as_of 시점 기준으로
-쟀는데 가격 데이터가 전 종목 2014년부터라, 미국 종목의 2017~2019 관측이
-모두 '단기' 로 분류된다. 단기/장기가 시기와 교란돼 있어 단기 상관이 높은 것
-(+0.42 vs +0.16)은 이력 길이가 아니라 **초기 기간 효과**일 수 있다.
-만점 비율 비교는 유효하나 상관 비교는 그대로 읽으면 안 된다.
+    cursor = anchor
+    # 지급일 커서. 확정 공시분이 있으면 그 마지막 지급일에서 이어받는다.
+    # 이어받지 않으면 확정분과 추정분의 이음매에서 한 달에 두 번 잡힌다.
+    confirmed_pays = sorted(p.pay_date for p in out)
+    pay_cursor = confirmed_pays[-1] if confirmed_pays else None
+    guard = 0
+    while guard < 40:
+        guard += 1
+        cursor = (_add_months(cursor, step_months, day_of_month) if step_months
+                  else cursor + timedelta(days=round(interval)))
+        if cursor > horizon:
+            break
+        # 배당락일이 휴장일이면 직전 거래일로 당긴다
+        ex_date = cursor if calendar.is_trading_day(cursor) else calendar.prev_business_day(cursor)
 
-**200일선 기울기 기간 분할**
+        if step_months and pay_cursor is not None:
+            # 지급일도 달력 월 단위로 옮긴다. 영업일 가산만 쓰면 2월처럼 짧은 달에서
+            # 지급이 다음 달로 넘어가 어떤 달은 0건, 어떤 달은 2건이 된다.
+            pay_cursor = _trading_day_in_month(
+                _add_months(pay_cursor, step_months, pay_cursor.day), calendar)
+            # 지급일이 배당락일보다 앞설 수는 없다. 월 단위로 옮기다 보면
+            # 배당락이 뒤로 밀린 달에 역전이 생길 수 있어 최소 1영업일 뒤로 민다.
+            if pay_cursor <= ex_date:
+                pay_cursor = calendar.add_business_days(ex_date, 1)
+            pay_date = pay_cursor
+        else:
+            pay_date = calendar.add_business_days(
+                ex_date, PAY_LAG_BUSINESS_DAYS.get(market, 5))
+            pay_cursor = pay_date
 
-| 항목 | 전체 | 동일종목차 | 양(+) | ~2021 | 2022~ |
-|---|---|---|---|---|---|
-| 기울기 | -0.257 | -11.8% | **0/23** | -0.409 | +0.030 |
+        out.append(PredictedPayout(
+            ticker, ex_date, pay_date, estimate, False,
+            calendar.is_estimated(ex_date), True, basis))
 
-국면별 — 상승장 -0.285 / 하락장 -0.251.
+    return sorted(out, key=lambda p: p.ex_date)
 
-23종 **전부** 음(-)으로, 이 연구에서 가장 일관된 항목이다. 기간을 나누면
-초기 강한 음(-0.409), 최근 사실상 0(+0.030). **어느 기간에서도 양(+)의
-예측력을 보인 적이 없어 8점 배점의 근거가 없다 → 제거 정당.**
-동시에 최근 기간이 0 이므로 **뒤집어 가점을 주는 것도 부당하다.**
-"제거는 중립, 뒤집기는 베팅" 이라는 원칙이 데이터로도 확인됐다.
 
-**종합 관찰.** 낙폭과 기울기 모두 신호가 2021년 이전에만 있고 이후 사라진다.
-둘은 사실 같은 현상('많이 빠진 것')의 양면이며, 2020년 급락과 V자 회복이
-그 신호를 통째로 만들었다. **가격 기반 타점 신호는 사실상 사건 하나에서
-나온다** — 타점 비중 축소의 가장 강한 근거다.
+def next_ex_date(ticker: str, market: str, history: list,
+                 calendar: TradingCalendar, today: date | None = None):
+    """다음 배당락일과 그것이 확정인지 추정인지.
 
-## 5. 판정
+    스코어의 배당락 항목이 이 값을 쓴다. 추정이면 화면에서 그렇게 표시해야 한다.
+    """
+    today = today or date.today()
+    upcoming = [p for p in predict_schedule(ticker, market, history, calendar, 6, today)
+                if p.ex_date > today]
+    if not upcoming:
+        return None, None, None
+    first = upcoming[0]
+    return first.ex_date, (first.ex_date - today).days, first.confirmed
 
-**타점 점수는 이후 수익을 예측하지 못한다.** 횡단면에서 보이던 약한 양(+)
-기울기는 종목을 고정하면 사라지거나 음(-)으로 뒤집힌다. 즉 "점수 높은 종목이
-더 좋았다" 는 신호였지 "지금이 살 때다" 를 맞힌 것이 아니다. 종합 점수의 더 큰
-기울기(+8.8%)는 품질 축이 과거 성과로 만들어진 데서 오는 **순환 논리**로
-설명될 수 있어, 예측력의 증거로 삼을 수 없다.
 
-**실패 메커니즘.** 국면 down 에서 타점 상위절반(+9.8%)이 하위절반(+12.8%)보다
-낮다. 200일선 기울기 8점은 하락 추세 종목을 거르려고 넣은 장치인데,
-2020·2022 급락 뒤 V자 반등 구간에서 **가장 좋은 매수 기회에 감점**을 줬다.
-고점 낙폭 6점의 가점보다 기울기 8점의 감점이 커서 방향이 뒤집혔다.
+def monthly_ledger(payouts: list, qty_map: dict, keep_rate: float,
+                   fx: float, currency_map: dict,
+                   today: date | None = None) -> list[dict]:
+    """배당예상일지 — 앞으로 12개월 월별 입금 예정.
 
-**부수 확인.** 프로덕션의 200일선 기울기는 저장 `ma200` 이 하루치뿐이라 계속
-중립으로 죽어 있었다(6절 결함 1). 백테스트는 이를 **살려서** 계산했음에도
-예측력이 없었다. 즉 그 버그를 고쳐도 타점 정확도는 나아지지 않는다.
-버그 수정과 로직 유효성은 별개 문제였다.
+    지급일(pay_date) 기준으로 모은다. 배당락일이 아니라 실제 돈이 들어오는 날이다.
+    """
+    today = today or date.today()
+    buckets: dict = {}
+    for p in payouts:
+        qty = qty_map.get(p.ticker, 0)
+        if qty <= 0 or p.pay_date < today:
+            continue
+        rate = fx if currency_map.get(p.ticker, "USD") == "USD" else 1.0
+        gross = p.dps * qty * rate
+        key = (p.pay_date.year, p.pay_date.month)
+        slot = buckets.setdefault(key, {
+            "year": key[0], "month": key[1],
+            "gross_krw": 0.0, "net_krw": 0.0, "items": [],
+            "all_confirmed": True,
+        })
+        slot["gross_krw"] += gross
+        slot["net_krw"] += gross * keep_rate
+        slot["items"].append({
+            "ticker": p.ticker, "pay_date": p.pay_date.isoformat(),
+            "ex_date": p.ex_date.isoformat(),
+            "net_krw": round(gross * keep_rate),
+            "confirmed": p.confirmed, "basis": p.basis,
+        })
+        if not p.confirmed:
+            slot["all_confirmed"] = False
 
-**분해가 밝힌 상쇄 구조.** 가격위치 20점은 성격이 반대인 신호를 한 점수에
-합쳐 놓았고, **부호가 틀린 항목에 더 큰 가중치**가 걸려 있다.
-
-```
-  기울기 8점  방향 반대 (-0.238)  ─┐
-  낙폭   6점  방향 맞음 (+0.310)  ─┼→  합계 -0.051 (상쇄 후 약간 뒤집힘)
-  20일   6점  거의 무 (-0.008)   ─┘
-```
-
-각 항목은 따로 보면 ±13% 씩 힘이 있는데, 합쳐 놓으니 서로를 지웠다.
-합계 점수가 "예측력 없음" 으로 보인 것은 신호가 없어서가 아니라
-**신호를 반대로 겹쳐 놓았기 때문**이다.
-
-**단, 부호를 뒤집는 것으로 결론내지 않는다.** 29종이 모두 같은 시장의 같은
-급락(2018 말·2020-03·2022)을 공유하므로 "28/29종 일관" 은 독립 관측 28건이
-아니라 실질적으로 **급락 사건 3~4건**에 대한 관측이다. 그 3~4건이 전부 빠르게
-회복한 시대였다. 종목 수가 근거를 실제보다 강해 보이게 만든다.
-
-## 6. 발견한 결함
-
-1. **저장 `ma200` 이 마지막 날짜 1행뿐** — `store.py` 는 매일 저장하도록 고쳐져
-   있으나 실제 DB 에는 반영되지 않았다. `recompute()` 는 60일 전 `ma200` 을
-   빼서 기울기를 내므로 **타점 20점 중 추세 8점이 상시 중립**이었고 신뢰도도
-   그만큼 깎이고 있었다. → `engine/asof.py` 가 종가에서 재계산하도록 하여 해소
-   (배포 시 적용).
-2. **`etf_price_daily` 에 `open`·`low` 컬럼 없음** — 레포의 `store.py` 는 두 컬럼을
-   INSERT 하므로, **v13 수집기는 이 DB 에서 정상 실행된 적이 없다.** 배당락 낙폭
-   지표도 전 구간 산출 불가. 마이그레이션 + 재수집 필요.
-3. **배당 이력이 2020-08 이후뿐** — 기성 ETF(SPY·VYM·SDY)조차 그렇다. 과거
-   시점에서 3·5년 CAGR 이 성립하지 않아 품질 축은 과거 검증이 불가능하다.
-4. **국내 종목 `rows_1y` 가 294** — 연간 거래일(약 246)을 초과해 중복 적재가
-   의심된다. 미조사, 이번 범위 밖.
-5. (작업 과정) 초기 데이터 진단 쿼리에서 두 테이블을 한 번에 LEFT JOIN 해
-   카티션 곱이 발생, 행수가 부풀려졌다. 테이블별 사전 집계로 정정.
-6. **`bt_report.quintile_table` 의 구간 표시가 원신호에서 무의미** — 값이
-   소수(-0.08 등)인데 `:.0f` 로 반올림해 `-0~-0` 으로 찍힌다. 집계 숫자 자체는
-   정상이며 라벨만 읽을 수 없다. 표시 전용 결함.
-
-## 7. 한계 — 이 결과로 단정하지 않는 것
-
-- **표본 중첩.** 월별 관측에 12개월 창을 쓰므로 창이 겹친다. 유효 독립표본은
-  표시된 n 보다 훨씬 적어 통계적 유의성은 주장하지 않는다. 방향과 단조성만 읽었다.
-- **기간 편향.** 2017~2026 은 대형주 강세와 급락 후 빠른 V자 반등이 반복된
-  특이 구간이다. "추세 추종형 감점" 이 불리했던 것은 이 시기 특성일 수 있다.
-- **국내 종목 기여 거의 없음.** 일봉이 2022~2023 부터라 사실상 미국 종목이
-  결론을 끌었다.
-- 따라서 결론은 "이 점수 체계가 **이 기간에** 작동하지 않았다" 이며,
-  "타이밍 판단 자체가 불가능하다" 는 아니다.
-
-## 8. 결론적 권고
-
-기간 분할 결과(4-4)를 반영해 **"타점 공식을 개선한다" 에서 "타점의 비중을
-낮춘다" 로 방향을 바꾼다.** 낙폭 신호조차 한 시대에만 강했으므로, 어떤 공식을
-쓰든 큰 가중치를 지탱하지 못한다.
-
-| 항목 | 현행 | 권고 | 근거 |
-|---|---|---|---|
-| 200일선 기울기 | 8점 | **점수 제거, 경고 유지** | 23/23종 음(-). 두 기간 모두 양(+)인 적 없음(4-6). 뒤집지 않는 이유는 최근 기간이 0 이고, 구조적 하락 종목에 최고점을 주게 되기 때문 |
-| 고점 낙폭 | 6점 | **D최소 = min(절대, 자기이력백분위)** | 유일하게 방향 일관. 혼합은 성능이 아니라 A 의 포화(만점 33%) 회피가 이유. 2022~ 강도 붕괴로 증량 불가 |
-| 20일 변동 | 6점 | **제거** | U자 비단조, 선형 배점 부적합 |
-| 환율 | 10점 | 현행(3년) 유지 | 5년 변경은 지지·반박 근거 모두 없음 |
-| 품질:타점 | 60:40 | **타점 비중 축소** | 타점 두 축이 검증 실패·검증 불가. 가격 신호는 사실상 2020년 사건 하나에서 나옴 |
-
-## 9. 남은 일
-
-- 위 권고에 따른 `score.py` 반영 및 재검증
-- 자기 기준 정규화 채택 시 최소 이력 요건 상향 검토
-  (`MIN_DD_HISTORY` 1년 → 3년. 4-6 에서 C 의 과대평가는 관측되지 않았으나
-  D최소는 A 의 하드코딩 상한을 여전히 안고 있다)
-- 이력 길이 교란 없는 재검증 — 종목별 상장일 기준으로 분리 (4-6 결함)
-- `open`·`low` 컬럼 마이그레이션 + 재수집 (결함 2)
-- `quintile_table` 구간 표시 포맷 수정 (결함 6)
-- `api/main.py` recompute 전환분 배포 (점수가 바뀌므로 별도 판단 필요)
-- 국내 종목 중복 적재 조사 (결함 4)
+    rows = sorted(buckets.values(), key=lambda r: (r["year"], r["month"]))
+    for row in rows:
+        row["gross_krw"] = round(row["gross_krw"])
+        row["net_krw"] = round(row["net_krw"])
+        row["items"].sort(key=lambda i: i["pay_date"])
+    return rows[:12]
