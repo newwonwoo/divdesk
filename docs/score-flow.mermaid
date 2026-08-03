@@ -1,39 +1,77 @@
+%% 채점 흐름 — 2026-08-02 백테스트 결과로 재설계한 판.
+%% 옛 판(배당률 백분위 30 / 200일선 이격도 / 배당락 임박 감점)은 폐기했다.
+%% 되돌리기 전에 docs/DESIGN.md 5절을 반드시 읽을 것.
 flowchart TB
 
-  START(["매일 배치 시작"]) --> Q{"수집 데이터<br/>있는가?"}
-  Q -->|"없음"| NA["'데이터 없음' 표시<br/>점수 산출 안 함"]
-  Q -->|"있음"| C1
+  START(["/scores/recompute"]) --> PANEL["engine/asof.py<br/>panel_from_rows()<br/>전 종목 시계열 일괄 적재"]
+  PANEL --> BUILD["build_input(ticker, as_of)<br/>★ 지표를 저장 컬럼이 아니라<br/>종가에서 그 시점 창으로 재계산<br/>(look-ahead 차단, 단위검증 있음)"]
+  BUILD --> Q{"가격 있고<br/>배당 1년치 이상?"}
+  Q -->|"아니오"| SKIP["건너뜀 — 추정으로 채우지 않음"]
+  Q -->|"예"| SPLIT
 
-  C1["① 배당률 백분위 30점<br/>현재 배당률이<br/>자기 5년 밴드에서 상위 몇 %"]
-  C1 --> C2["② 가격 위치 20점<br/>200일선 이격도<br/>+ 52주 밴드 위치"]
-  C2 --> C3["③ 분배금 건강도 20점<br/>12개월 DPS vs 전년<br/>감액·중단 이력"]
-  C3 --> C4["④ 총수익 정합성 10점<br/>분배율 vs 총수익률<br/>분배가 원금 깎는지"]
-  C4 --> C5["⑤ 환율 백분위 10점<br/>USD/KRW 3년 위치<br/>원화투자자 관점"]
-  C5 --> C6["⑥ 배당락 타이밍 10점<br/>ex-date 임박 감점<br/>직후 가점"]
+  SPLIT{"항목별 채점"}
 
-  C6 --> SUM["합계 0~100<br/>+ 근거 문장 생성"]
-  SUM --> CCQ{"커버드콜<br/>종목인가?"}
-  CCQ -->|"예"| BADGE["'분배금 ≠ 수익' 배지<br/>점수와 무관하게 강제"]
-  CCQ -->|"아니오"| GRADE
-  BADGE --> GRADE
+  subgraph QUAL["품질 축 — 이 상품이 꾸준한가"]
+    A1["배당률 수준 18<br/>3.5~6% 만점<br/>6% 초과는 고배당 함정 감점"]
+    A2["분배금 성장 15<br/>3년CAGR 6 + 5년 4<br/>+ 감액이력 3 + 변동성 2"]
+    A3["위험조정 수익 15<br/>min(Sortino,Calmar)×0.7<br/>+ Sharpe×0.3, 3년"]
+    A4["배당락 회복력 10<br/>시장보정 낙폭 ÷ 배당금<br/>⚠ open 컬럼 없어 현재 중립"]
+  end
 
-  GRADE{"점수 구간"}
-  GRADE -->|"85 이상"| G1["적극매수<br/>+ 웹푸시 알람"]
+  subgraph TIME["타점 축 — 지금 얼마나 싼가"]
+    B1["가격 위치 20<br/>min(절대낙폭, 자기이력순위)<br/>둘 다 만족해야 고득점"]
+    B2["환율 10<br/>기초자산 통화 기준<br/>3년 밴드 위치"]
+  end
+
+  SPLIT --> A1
+  SPLIT --> A2
+  SPLIT --> A3
+  SPLIT --> A4
+  SPLIT --> B1
+  SPLIT --> B2
+
+  SPLIT --> YP["배당률 이력 위치 12<br/>원인에 따라 두 축으로 분배"]
+  YP -->|"배당이 늘어서"| QUAL
+  YP -->|"주가가 빠져서"| TIME
+
+  QUAL --> QS["품질 0~100"]
+  TIME --> TS["타점 0~100"]
+
+  QS --> TOT["종합 = 품질×0.75 + 타점×0.25"]
+  TS --> TOT
+
+  TOT --> CONF{"데이터 신뢰도<br/>50% 이상?"}
+  CONF -->|"아니오"| HOLD["판단보류<br/>빈 항목 수를 함께 표시"]
+  CONF -->|"예"| FLOOR{"품질 50점<br/>이상?"}
+  FLOOR -->|"아니오"| EXC["제외 — 싸도 사지 않는다"]
+  FLOOR -->|"예"| GRADE{"종합 점수"}
+
+  GRADE -->|"85+"| G1["적극매수"]
   GRADE -->|"70~84"| G2["매수"]
   GRADE -->|"55~69"| G3["분할·관망"]
   GRADE -->|"55 미만"| G4["보류"]
 
-  G1 --> SAVE[("score_snapshot 적재")]
-  G2 --> SAVE
-  G3 --> SAVE
-  G4 --> SAVE
+  G1 --> CC
+  G2 --> CC
+  G3 --> CC
+  G4 --> CC
+  EXC --> CC
+  HOLD --> CC
+
+  CC{"커버드콜?"}
+  CC -->|"예"| BADGE["'분배금 ≠ 수익' 배지<br/>점수와 무관하게 강제"]
+  CC -->|"아니오"| SAVE
+  BADGE --> SAVE[("score_snapshot 적재<br/>facts JSON 에<br/>항목표·품질·타점·신뢰도")]
+
+  WARN["경고로만 남긴 것 (점수 미반영)<br/>· 200일선 하락 추세<br/>· 최근 1개월 급등<br/>검증에서 방향이 반대이거나 비단조였다"]
+  B1 -.-> WARN
 
   classDef ok fill:#DDE6E4,stroke:#0E6F63,color:#0F1E3D
   classDef warn fill:#FBF0EA,stroke:#A63A18,color:#0F1E3D
   classDef core fill:#FFFFFF,stroke:#0F1E3D,color:#0F1E3D
   classDef store fill:#E9EDF2,stroke:#4A5872,color:#0F1E3D
 
-  class G1 ok
-  class NA,BADGE,G4 warn
-  class C1,C2,C3,C4,C5,C6,SUM core
+  class G1,G2 ok
+  class SKIP,EXC,HOLD,BADGE,G4,WARN,A4 warn
+  class A1,A2,A3,B1,B2,YP,QS,TS,TOT,PANEL,BUILD core
   class SAVE store

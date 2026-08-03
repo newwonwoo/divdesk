@@ -27,7 +27,7 @@ from engine.exdrop import (RECOVERY_LIMIT, ExDropSample, ExDropStat,
                            compute_sample, summarize)
 from engine.projection import common_start
 from engine.projection import compare as compare_projections
-from engine.projection import growth_quality, simulate
+from engine.projection import growth_quality, period_label, simulate
 from engine.returns import Lot, portfolio_return, position_return
 from engine.tax import MODES, TaxEngine
 from alerts import push
@@ -310,7 +310,10 @@ def health():
 
 @app.get("/etfs")
 def list_etfs(market: str | None = None):
+    # tags 에는 추종 지수와 성격 한 줄이 들어 있다. 개별 보유 종목은 수집하지
+    # 않으므로, 화면에서 "무엇을 담고 있는 상품인가" 에 답하는 건 이 두 가지다.
     sql = """SELECT m.ticker, m.name, m.market, m.strategy, m.pay_freq,
+                    m.pays_per_year, m.tags,
                     m.expense_ratio, m.is_covered_call, m.is_benchmark, m.kr_alt_ticker,
                     p.close, p.date AS price_date,
                     s.total AS score, s.reason
@@ -720,10 +723,17 @@ class ProjectionReq(BaseModel):
     환율 추세가 섞여 종목 비교가 오염된다. 원화는 현재 환율을 곱한 참고값으로만 준다.
     """
     monthly_usd: float = Field(gt=0)
-    years: int = Field(gt=0, le=30)
+    # 기간은 연 + 개월로 받는다. 예전에는 정수 연 단위뿐이라 5년·10년처럼 거칠게만
+    # 고를 수 있었다. 엔진에는 총 개월 수 하나로 넘긴다.
+    years: int = Field(default=0, ge=0, le=30)
+    months: int = Field(default=0, ge=0, le=360)
     tickers: list[str]
     with_benchmark: bool = True
     currency: str = "USD"        # USD 또는 KRW. 입력 금액의 통화
+
+    @property
+    def total_months(self) -> int:
+        return self.years * 12 + self.months
 
 
 @app.post("/projection")
@@ -753,17 +763,21 @@ def projection(req: ProjectionReq):
     # 과거 폭락장을 겪은 것으로 나와 비교가 왜곡되므로 공통 구간으로 자른다.
     # 다만 이력이 짧은 종목 하나 때문에 전체가 막히면 안 되니, 요청 기간을
     # 못 채우는 종목은 공통 구간 계산에서 빼고 따로 알린다.
-    need_months = req.years * 12 + 1
+    total_months = req.total_months
+    if total_months <= 0:
+        raise HTTPException(400, "기간을 1개월 이상으로 지정하세요")
+    need_months = total_months + 1
     eligible, too_short = {}, []
     for ticker, series in series_map.items():
-        months = len({(d.year, d.month) for d, _ in series})
-        if months >= need_months:
+        have = len({(d.year, d.month) for d, _ in series})
+        if have >= need_months:
             eligible[ticker] = series
         else:
             too_short.append(ticker)
     if not eligible:
         raise HTTPException(
-            422, f"{req.years}년을 시뮬레이션할 만큼 이력이 긴 종목이 없습니다. "
+            422, f"{period_label(total_months)}을 시뮬레이션할 만큼 이력이 긴 "
+                 f"종목이 없습니다. "
                  f"기간을 줄여보세요.")
 
     since = common_start(eligible)
@@ -773,7 +787,7 @@ def projection(req: ProjectionReq):
     for ticker, series in eligible.items():
         try:
             results.append(simulate(ticker, series, monthly,
-                                    req.years, since=since))
+                                    total_months, since=since))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -785,9 +799,10 @@ def projection(req: ProjectionReq):
     return {
         "monthly_usd": round(monthly, 2),
         "monthly_input": req.monthly_usd, "currency": req.currency,
-        "years": req.years,
-        "total_invested_usd": round(monthly * req.years * 12, 2),
-        "total_invested_krw": round(monthly * req.years * 12 * fx),
+        "years": req.years, "months": req.months,
+        "period_label": period_label(total_months),
+        "total_invested_usd": round(monthly * total_months, 2),
+        "total_invested_krw": round(monthly * total_months * fx),
         "fx": fx, "fx_date": fx_date,
         "fx_note": (f"환율 {fx:,.1f}원 고정 가정입니다. "
                     "10년 뒤 환율은 알 수 없고, 과거 환율로 굴리면 환율 추세가 섞여 "

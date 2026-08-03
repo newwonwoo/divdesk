@@ -42,6 +42,10 @@ function Notes({ items, title = '계산 기준과 주의사항' }) {
 
 const Err = ({ msg }) => msg ? <div className="warn">{msg}</div> : null
 
+// 지급주기 코드를 사람 말로. 월배당인지 분기배당인지가 종목을 고르는 첫 기준인데
+// 마스터에만 있고 화면에는 안 나오고 있었다.
+const PAY_LABEL = { M: '월배당', Q: '분기배당', SA: '반기배당', A: '연배당' }
+
 // 만원 단위. 막대 위에 숫자가 없으면 높이만 보고 크기를 가늠해야 한다.
 const manwon = (v) => {
   const n = Math.round(Number(v) / 10000)
@@ -81,7 +85,6 @@ function Calculator({ etfs, onDoc }) {
   const [target, setTarget] = useState('1,000,000')
   const [items, setItems] = useState([])
   const [sel, setSel] = useState('')
-  const [amt, setAmt] = useState('')
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -94,6 +97,10 @@ function Calculator({ etfs, onDoc }) {
   const totalAmount = items.reduce((a, i) => a + i.amount, 0)
   const onAdd = (row) => setItems(p => [...p.filter(x => x.ticker !== row.ticker), row])
   const onRemove = (t) => setItems(p => p.filter(x => x.ticker !== t))
+  // 종목별 금액은 각 줄에서 직접 고친다. 예전에는 담기 전에 금액을 한 번 넣고 나면
+  // 그 뒤로 못 바꿔서, 배분을 조정하려면 지우고 다시 담아야 했다.
+  const onAmount = (t, v) =>
+    setItems(p => p.map(x => (x.ticker === t ? { ...x, amount: v } : x)))
 
   const run = async () => {
     setBusy(true); setErr(''); setData(null)
@@ -157,32 +164,50 @@ function Calculator({ etfs, onDoc }) {
                   ))}
                 </select>
                 {selMeta && (
-                  <div className="pick-info">
-                    <span className="tag">{selMeta.strategy}</span>
-                    {selMeta.expense_ratio != null &&
-                      <span className="tag">보수 {selMeta.expense_ratio}%</span>}
-                    {selMeta.score != null && <span className="tag">타점 {selMeta.score}점</span>}
-                    {selMeta.is_covered_call &&
-                      <span className="tag warn-tag">분배금 ≠ 수익</span>}
-                  </div>
+                  <>
+                    <div className="pick-info">
+                      <span className="tag">{selMeta.strategy}</span>
+                      {/* 배당 횟수는 마스터에 있는데 화면에 안 나오고 있었다.
+                          월배당인지 분기배당인지가 담을 종목을 고르는 첫 기준이다. */}
+                      {selMeta.pay_freq &&
+                        <span className="tag">{PAY_LABEL[selMeta.pay_freq] || selMeta.pay_freq}</span>}
+                      {selMeta.expense_ratio != null &&
+                        <span className="tag">보수 {selMeta.expense_ratio}%</span>}
+                      {selMeta.score != null && <span className="tag">타점 {selMeta.score}점</span>}
+                      {selMeta.is_covered_call &&
+                        <span className="tag warn-tag">분배금 ≠ 수익</span>}
+                    </div>
+                    {/* 개별 보유 종목은 수집하지 않는다. 대신 추종 지수와 성격을 보여준다 —
+                        "무엇을 담고 있는 상품인가" 에 실질적으로 답하는 정보다. */}
+                    {(selMeta.tags?.index || selMeta.tags?.note) && (
+                      <div className="hint" style={{ marginTop: 6 }}>
+                        {selMeta.tags.index && <>지수 {selMeta.tags.index}</>}
+                        {selMeta.tags.index && selMeta.tags.note && ' · '}
+                        {selMeta.tags.note}
+                      </div>
+                    )}
+                  </>
                 )}
-                <div className="field" style={{ marginTop: 12 }}>
-                  <input inputMode="numeric" placeholder="금액" value={amt}
-                    onChange={e => setAmt(commafy(e.target.value))} />
-                  <em>원</em>
-                </div>
-                <button className="btn ghost" disabled={!sel || uncomma(amt) <= 0}
+                {/* 금액은 담은 뒤 종목별 줄에서 입력한다. 담기 전에 한 번만 받으면
+                    여러 종목 배분을 비교하며 조정할 수 없다. */}
+                <button className="btn ghost" disabled={!sel}
                   onClick={() => {
-                    onAdd({ ticker: sel, amount: uncomma(amt), meta: selMeta })
-                    setSel(''); setAmt('')
+                    onAdd({ ticker: sel, amount: 0, meta: selMeta })
+                    setSel('')
                   }}>담기</button>
 
                 {items.length > 0 && (
                   <div className="picked">
                     {items.map(i => (
-                      <div className="picked-row" key={i.ticker}>
+                      <div className="picked-row amt-row" key={i.ticker}>
                         <span>{label(i.meta) || i.ticker}</span>
-                        <b className="num">{won(i.amount)}원</b>
+                        <span className="field inline">
+                          <input inputMode="numeric" placeholder="금액"
+                            value={i.amount ? commafy(String(i.amount)) : ''}
+                            onChange={ev =>
+                              onAmount(i.ticker, uncomma(ev.target.value))} />
+                          <em>원</em>
+                        </span>
                         <button className="del"
                           onClick={() => onRemove(i.ticker)}>삭제</button>
                       </div>
@@ -266,7 +291,10 @@ function Projection({ etfs, onDoc }) {
   const [picked, setPicked] = useState(['SCHD'])
   const [monthly, setMonthly] = useState('500')
   const [cur, setCur] = useState('USD')
+  // 기간은 연+개월. 예전에는 5·10·15·20년 버튼뿐이라 '3년 6개월' 같은 걸 못 골랐다.
   const [years, setYears] = useState(10)
+  const [months, setMonths] = useState(0)
+  const totalMonths = years * 12 + months
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -280,7 +308,7 @@ function Projection({ etfs, onDoc }) {
     try {
       setData(await api.projection({
         monthly_usd: cur === 'KRW' ? uncomma(monthly) : Number(monthly),
-        currency: cur, years, tickers: picked,
+        currency: cur, years, months, tickers: picked,
       }))
     } catch (e) { setErr(e.message) } finally { setBusy(false) }
   }
@@ -309,11 +337,31 @@ function Projection({ etfs, onDoc }) {
         </div>
 
         <label style={{ marginTop: 16 }}>기간</label>
-        <div className="dir">
-          {[5, 10, 15, 20].map(y => (
-            <button key={y} aria-selected={years === y}
-              onClick={() => { setYears(y); setData(null) }}>{y}년</button>
-          ))}
+        <div className="period">
+          <span className="field inline">
+            <input inputMode="numeric" value={years}
+              onChange={ev => {
+                setYears(Math.min(30, Math.max(0, Number(ev.target.value.replace(/[^0-9]/g, '')) || 0)))
+                setData(null)
+              }} />
+            <em>년</em>
+          </span>
+          <span className="field inline">
+            <input inputMode="numeric" value={months}
+              onChange={ev => {
+                setMonths(Math.min(11, Math.max(0, Number(ev.target.value.replace(/[^0-9]/g, '')) || 0)))
+                setData(null)
+              }} />
+            <em>개월</em>
+          </span>
+          <span className="period-quick">
+            {[12, 36, 60, 120, 240].map(mm => (
+              <button key={mm} type="button" aria-selected={totalMonths === mm}
+                onClick={() => { setYears(Math.floor(mm / 12)); setMonths(mm % 12); setData(null) }}>
+                {mm / 12}년
+              </button>
+            ))}
+          </span>
         </div>
 
         <label style={{ marginTop: 16 }}>매수 종목</label>
@@ -322,18 +370,27 @@ function Projection({ etfs, onDoc }) {
             <button key={e.ticker} className="pick" aria-pressed={picked.includes(e.ticker)}
               onClick={() => toggle(e.ticker)}>
               <span className="pick-name">{label(e)}</span>
+              {/* 배당 주기와 추종 지수도 함께 보여준다. 종목을 고를 때 월배당인지
+                  분기배당인지, 무엇을 담는 상품인지가 보수·점수만큼 중요하다. */}
               <span className="pick-meta">
                 {e.strategy}
+                {e.pay_freq && ` · ${PAY_LABEL[e.pay_freq] || e.pay_freq}`}
                 {e.expense_ratio != null && ` · 보수 ${e.expense_ratio}%`}
                 {e.score != null && ` · 타점 ${e.score}점`}
                 {e.is_covered_call && ' · 분배금 ≠ 수익'}
               </span>
+              {(e.tags?.index || e.tags?.note) && (
+                <span className="pick-idx">
+                  {e.tags.index || e.tags.note}
+                </span>
+              )}
             </button>
           ))}
         </div>
         <div className="hint">SPY·VOO·QQQ는 비교 기준으로 항상 함께 계산됩니다.</div>
 
-        <button className="btn" disabled={busy || !picked.length || !Number(monthly)}
+        <button className="btn"
+          disabled={busy || !picked.length || !Number(monthly) || totalMonths <= 0}
           onClick={run}>
           {busy ? '계산 중…' : '계산하기'}
         </button>
@@ -342,11 +399,11 @@ function Projection({ etfs, onDoc }) {
 
       {data && (
         <div className="card">
-          <h2>{data.years}년 뒤 예상</h2>
+          <h2>{data.period_label || `${data.years}년`} 뒤 예상</h2>
           <div className="hero-sub">
             매달 {data.currency === 'KRW'
               ? `${won(uncomma(monthly))}원 (약 $${Math.round(data.monthly_usd)})`
-              : `$${Number(monthly).toLocaleString()}`} × {data.years * 12}개월
+              : `$${Number(monthly).toLocaleString()}`} × {(data.years ?? 0) * 12 + (data.months ?? 0)}개월
             <br />총 ${data.total_invested_usd.toLocaleString()} ·
             {' '}{won(data.total_invested_krw)}원 투입
           </div>
@@ -453,6 +510,21 @@ function Screener({ onDoc }) {
       {withScore.map(e => {
         const g = GRADE(e.total)
         const [why, warn] = (e.reason || '').split('⚠')
+        // score_snapshot.facts 는 두 형식이 섞여 있다.
+        //   옛 형식  [[항목, 값, 부연, 획득, 만점], ...]        항목표만
+        //   새 형식  {facts:[...], quality, timing, excluded, confidence}
+        // 재계산을 돌리기 전까지는 DB에 옛 형식이 남아 있으므로 둘 다 받아야 한다.
+        //
+        // 이걸 꺼내지 않고 quality/timing/facts 를 그냥 참조하면 ReferenceError 가 나고,
+        // 리액트가 트리를 통째로 버려서 타점 탭이 빈 화면이 된다. 실제로 그랬다.
+        const raw = e.facts
+        const wrapped = raw && !Array.isArray(raw) ? raw : null
+        const facts = Array.isArray(raw) ? raw
+          : Array.isArray(wrapped?.facts) ? wrapped.facts : []
+        const quality = wrapped?.quality ?? null
+        const timing = wrapped?.timing ?? null
+        const excluded = !!wrapped?.excluded
+        const confidence = wrapped?.confidence ?? null
         return (
           <div className="etf" key={e.ticker}>
             <div className={`score ${g.cls}`}><b>{e.total}</b><s>{g.text}</s></div>

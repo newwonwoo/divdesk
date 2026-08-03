@@ -445,3 +445,33 @@ table.facts tr.ftot .fp b{font-size:17px;color:var(--in)}
 .conf{display:inline-block;margin-left:8px;padding:2px 8px;border-radius:3px;
   background:var(--rule);color:var(--ink-2);font-size:11.5px;font-weight:600}
 .conf.bad{background:#FBF0EA;color:var(--out)}
+
+/* 담은 종목 줄 안의 금액 입력.
+   .field 는 화면 폭을 쓰는 큰 입력이라 줄 안에 그대로 넣으면 레이아웃이 깨진다.
+   종목별로 얼마씩 넣을지 나란히 비교하며 고칠 수 있어야 해서 줄마다 입력을 둔다. */
+.field.inline{
+  flex:0 0 auto;width:150px;padding-bottom:2px;border-bottom-width:1.5px;
+  background:transparent;
+}
+.field.inline input{
+  font-size:15px;font-weight:700;text-align:right;padding:2px 0;
+}
+.field.inline em{font-size:12px;padding-left:4px}
+.picked-row.amt-row span:first-child{flex:1;min-width:0}
+
+/* 추종 지수 한 줄. 개별 보유 종목은 수집하지 않으므로 '무엇을 담는 상품인가'는
+   지수명으로 답한다. 보조 정보라 한 단계 더 흐리게 둔다. */
+.pick-idx{display:block;font-size:11.5px;color:var(--ink-2);opacity:.75;margin-top:2px}
+
+/* 적립 기간 — 연 + 개월 직접 입력. 5년 단위 버튼만 두면 '3년 6개월' 을 못 고른다.
+   자주 쓰는 값은 옆에 빠른 선택으로 남겨 둔다. */
+.period{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.period .field.inline{width:92px}
+.period-quick{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+.period-quick button{
+  border:1.5px solid var(--rule);background:transparent;border-radius:4px;
+  padding:5px 10px;font-size:12.5px;font-weight:600;color:var(--ink-2);cursor:pointer;
+}
+.period-quick button[aria-selected="true"]{
+  border-color:var(--ink);background:var(--ink);color:#fff;
+}

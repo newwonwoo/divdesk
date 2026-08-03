@@ -554,7 +554,7 @@ from engine.projection import simulate, common_start, growth_quality
 from datetime import timedelta as _td
 # 매달 1% 씩 오르는 가상 종목: 12개월 적립하면 원금보다 커야 한다
 rising = [(date(2020,1,1) + _td(days=30*i), 100 * (1.01 ** i)) for i in range(80)]
-p1 = simulate('R', rising, 1_000_000, 3)
+p1 = simulate('R', rising, 1_000_000, 36)      # 기간은 총 개월 수
 eq("시뮬레이션 구간 생성", p1.windows > 0, True)
 eq("총 투입액", p1.total_invested_krw, 36_000_000)
 eq("상승장이면 원금 초과", p1.median_final_krw > p1.total_invested_krw, True)
@@ -563,13 +563,24 @@ eq("최악 <= 중간 <= 최선",
    p1.worst.final_value <= p1.median.final_value <= p1.best.final_value, True)
 
 falling = [(date(2020,1,1) + _td(days=30*i), 100 * (0.99 ** i)) for i in range(80)]
-p2 = simulate('F', falling, 1_000_000, 3)
+p2 = simulate('F', falling, 1_000_000, 36)
 eq("하락장이면 원금 미달", p2.median_final_krw < p2.total_invested_krw, True)
 eq("손실 구간 표시", p2.loss_windows > 0, True)
 
 short = [(date(2025,1,1) + _td(days=30*i), 100.0) for i in range(10)]
-p3 = simulate('S', short, 1_000_000, 5)
+p3 = simulate('S', short, 1_000_000, 60)
 eq("이력 부족은 계산 안 함", p3.windows, 0)
+# 연 단위로만 고르던 기간을 개월로 풀었다. 3년 6개월 같은 값이 되어야 한다.
+from engine.projection import period_label as _plab
+eq("기간 표기 연+월", _plab(42), "3년 6개월")
+eq("기간 표기 연만", _plab(36), "3년")
+eq("기간 표기 월만", _plab(7), "7개월")
+eq("18개월도 계산됨", simulate('H', rising, 1_000_000, 18).windows > 0, True)
+try:
+    simulate('Z', rising, 1_000_000, 0)
+    eq("0개월 거부", "통과", "ValueError")
+except ValueError:
+    eq("0개월 거부", "ValueError", "ValueError")
 eq("부족 사유 안내", any('필요한데' in n for n in p3.notes), True)
 
 # 공통 시작일: 늦게 상장한 쪽에 맞춰야 비교가 공정하다
