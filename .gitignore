@@ -1,0 +1,19 @@
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 프론트
+node_modules/
+web/dist/
+web/.vercel/
+
+# 비밀값 — 절대 커밋 금지 (CLAUDE.md "하지 말 것")
+.env
+.env.*
+*.pem
+*.key
+
+# 잡동사니
+.DS_Store

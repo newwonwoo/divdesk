@@ -68,7 +68,10 @@ sudo -u divdesk psql divdesk -c \
 ```
 
 이 때문에 **배당락 회복력 10점이 전 구간 중립**이다(낙폭 계산에 시가가 필요).
-`db/migrate.py` 에 컬럼 추가를 넣고 재수집하면 함께 풀린다.
+
+**정정(2026-08-03):** `db/migrate.py` 30~33행에 `open`·`low` 의 `ADD COLUMN IF NOT
+EXISTS` 가 **이미 들어 있다.** 코드 쪽 할 일은 끝났고 남은 건 서버 작업뿐이다 —
+EC2 에서 `python -m db.migrate` 를 돌리고 재수집하면 함께 풀린다.
 
 ### 2순위 · 국내 종목 중복 적재 의심
 
@@ -95,8 +98,11 @@ sudo -u divdesk psql divdesk -c \
 - `scripts/bt_variants.py` 의 `rolling_dd` 가 `engine/asof.py` 의 `_dd_history` 와
   중복 구현 — 통합 대상
 - `scripts/bt_report.py` 의 5분위 구간 표시가 원신호(소수)에서 `-0~-0` 으로 찍힘
-- 레포 루트에 웹 업로드 사고로 생긴 파일 50여 개가 남아 있을 수 있다.
-  동작에는 영향 없으나 정리 대상
+- ~~레포 루트에 웹 업로드 사고로 생긴 파일~~ → **2026-08-03 해소.** 잔해 16개
+  (루트 10 + `engine/` 6)를 삭제했다. `docs/QUALITY-레포정리.md` 참조.
+  **"동작에는 영향 없다"는 판단은 틀렸었다** — 잔해 중 `main.py`(내용은 App.jsx)와
+  `score.py`(내용은 마크다운)가 `make verify` ①문법을 실패시켜 **커밋 게이트가
+  막혀 있었다.** 확장자와 내용이 어긋난 파일은 무해하지 않다.
 
 ## 4. 하지 말 것 — 검증으로 걸러낸 것들
 
