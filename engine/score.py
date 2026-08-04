@@ -351,11 +351,12 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
             ex_sub += f" · 회복 {inp.exdrop_recovery:g}일"
         if inp.exdrop_unrecovered:
             ex_sub += f" · 미회복 {inp.exdrop_unrecovered}회"
+        # 장중 되돌림은 부연에만 적는다. 여기에 경고를 달면 안 된다 —
+        # 낙폭 배수가 0.65배(=배당금보다 덜 떨어진 좋은 종목)여도 되돌림만
+        # 있으면 "배당 이상으로 밀린다" 는 반대 뜻 경고가 붙었다.
+        # 그 경고는 위 ratio > 1.2 분기 하나만 담당한다.
         if inp.exdrop_gap is not None and inp.exdrop_gap > 0.1:
             ex_sub += f" · 장중 {inp.exdrop_gap:+.1f}% 되돌림"
-            warnings.append(
-                f"배당락일에 배당금의 {ratio:.1f}배만큼 떨어집니다 — "
-                "배당을 노린 매물이 몰려 받은 배당 이상으로 주가가 밀립니다")
         reasons.append(f"배당락 낙폭 {ratio:.2f}배 ({ex_sub})")
     if inp.days_to_ex is not None:
         ex_sub += f" · 다음 배당락 {inp.days_to_ex}일 뒤"
