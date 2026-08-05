@@ -87,9 +87,14 @@ class ScoreInput:
     # 상장 통화가 아니라 **기초자산 통화**를 본다.
     # TIGER 미국배당다우존스는 원화 상장이지만 기초자산이 미국이라
     # 환율에 그대로 노출된다. 상장 통화로 판단하면 이걸 놓친다.
-    fx_exposed: bool | None = None         # 환율 노출 여부
+    #
+    # 예전에는 이 필드가 두 번 선언돼 있었다(`bool | None = None` 과
+    # `bool = True`). 파이썬은 뒤엣것만 남기므로 실제 기본값은 True 였고,
+    # 앞 선언을 전제로 쓴 `is not None` 분기는 도달할 수 없었다.
+    # 기본값(True)은 그대로 두고 선언만 하나로 합친다 — None 을 명시적으로
+    # 넘기면 상장 통화로 되짚는 분기가 다시 살아난다.
+    fx_exposed: bool | None = True         # 기초자산이 해외라 환율에 노출되는가
     fx_hedged: bool = False                # 환헤지 상품인가
-    fx_exposed: bool = True                # 기초자산이 해외라 환율에 노출되는가
 
 
 @dataclass
@@ -107,7 +112,6 @@ class ScoreResult:
     quality: int = 0        # 상품 품질 0~100
     timing: int = 0         # 매수 타점 0~100
     excluded: bool = False  # 품질 하한 미달
-    confidence: int = 100   # 데이터 신뢰도 0~100
     confidence: int = 100   # 데이터 신뢰도 0~100. 중립 처리한 항목이 많을수록 낮다
     # [(라벨, 값, 부연, 획득점수, 만점)] — 화면이 표로 그리고 합계를 검산할 수 있다
     facts: list = field(default_factory=list)
@@ -421,8 +425,16 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
 
     # 데이터 신뢰도. 비어 있는 항목은 절반 점수를 자동으로 받는데,
     # 그걸 알리지 않으면 사용자는 그 숫자를 실제 분석 결과로 오해한다.
-    # 항목이 6개이므로 하나 빌 때마다 신뢰도가 크게 떨어진다.
-    confidence = max(0, 100 - len(missing) * 16)
+    #
+    # 중립 처리될 수 있는 항목 수. 200일선 추세·20일 변동을 점수에서 빼면서
+    # 8 → 6 으로 줄었다(배당률 이력 / 낙폭 / 분배금 / 위험조정 / 환율 / 배당락).
+    #
+    # 예전에는 여기서 `100 - len(missing)*16` 으로 한 번, 아래에서
+    # `(1 - len(missing)/6)*100` 으로 또 한 번 계산했다. 등급 판정은 앞의 값을,
+    # 화면 표시는 뒤의 값을 써서 둘이 어긋났다(결측 3개면 52 vs 50).
+    # 결론이 갈리는 구간이 없어 증상은 없었지만 정본을 하나로 둔다.
+    TOTAL_ITEMS = 6
+    confidence = max(0, round((1 - len(missing) / TOTAL_ITEMS) * 100))
 
     if confidence < 50:
         grade = "판단보류"
@@ -448,10 +460,6 @@ def score(inp: ScoreInput, today: date | None = None) -> ScoreResult:
 
     # 데이터가 없어 중립(50%)으로 처리한 항목이 많으면 점수를 믿기 어렵다.
     # 그 사실을 점수와 함께 드러내야 한다. 숨기면 빈 데이터가 평균 점수로 둔갑한다.
-    # 중립 처리될 수 있는 항목 수. 200일선 추세·20일 변동을 점수에서 빼면서
-    # 8 → 6 으로 줄었다(배당률 이력 / 낙폭 / 분배금 / 위험조정 / 환율 / 배당락).
-    TOTAL_ITEMS = 6
-    confidence = max(0, round((1 - len(missing) / TOTAL_ITEMS) * 100))
     if len(missing) >= 3:
         warnings.append(
             f"데이터 {len(missing)}개 항목이 비어 중립 처리했습니다 "

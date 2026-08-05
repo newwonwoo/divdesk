@@ -1,8 +1,9 @@
-.PHONY: help install db seed verify probe toss toss-dry opening collect collect-us collect-kr collect-dry score serve web alerts alerts-dry vapid clean
+.PHONY: help install db migrate seed verify probe toss toss-dry opening collect collect-us collect-kr collect-dry score serve web alerts alerts-dry vapid clean
 
 help:
 	@echo "install      의존성 설치 (python + npm)"
 	@echo "db           스키마 적용 (DIVDESK_DSN 필요)"
+	@echo "migrate      기존 테이블에 새 컬럼 반영 (open/low 등)"
 	@echo "seed         종목 마스터 31종 시딩"
 	@echo "verify       검증 4단계 - 커밋 전 필수"
 	@echo "probe        국내 엔드포인트 실측 - EC2에서 먼저 실행"
@@ -24,6 +25,9 @@ install:
 
 db:
 	psql "$$DIVDESK_DSN" -f db/schema.sql
+
+migrate:
+	python3 -m db.migrate
 
 seed:
 	python3 scripts/seed_master.py

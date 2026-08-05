@@ -68,6 +68,18 @@ class Store:
 
         series = sorted(pad(row) for row in series)
 
+        # 주말 행은 어느 거래소에도 존재할 수 없다. 들어오면 200일선·52주 창이
+        # 그만큼 밀리고, `engine/calendar.py` 가 거래일을 **수집된 날짜에서**
+        # 도출하므로 휴장일 판정까지 함께 틀어진다.
+        # 공휴일 표는 만들지 않지만(매년 갱신 누락으로 조용히 틀어진다) 주말은
+        # 표가 필요 없는 구조적 사실이라 여기서 막는다. 조용히 버리지 않고
+        # 개수를 돌려줘 수집 로그에 남긴다.
+        weekend = [row for row in series if row[0].weekday() >= 5]
+        if weekend:
+            series = [row for row in series if row[0].weekday() < 5]
+        if not series:
+            return {"days": 0, "weekend_dropped": len(weekend)}
+
         # 과거 월봉이 섞여 있을 수 있으므로, 지표는 '연속된 일봉 구간'에서만 낸다.
         # 직전 관측과 7일 넘게 벌어진 지점 이후를 일봉으로 본다.
         daily_start = 0
@@ -113,7 +125,8 @@ class Store:
                  ind[0], ind[1], ind[2], src))
         self._bump("prices", len(series))
         return {"ma200": ma200, "high52": high52, "low52": low52,
-                "days": len(series)}
+                "days": len(series), "weekend_dropped": len(weekend),
+                "with_open": sum(1 for row in series if row[3] is not None)}
 
     def upsert_dividends(self, divs: list, conflict_dates: set | None = None) -> None:
         bad = conflict_dates or set()

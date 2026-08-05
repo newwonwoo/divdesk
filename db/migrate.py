@@ -96,3 +96,32 @@ def run(conn) -> dict:
     else:
         log.info("스키마 %d건 확인 완료", len(applied))
     return {"applied": len(applied), "failed": failed}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m db.migrate` 진입점.
+
+    서버가 뜰 때 `api.main` 이 같은 `run()` 을 부르므로 평소엔 사람이 할 일이
+    없다. 그런데 배포 문서(HANDOFF 3절)는 이 명령을 직접 돌리라고 안내하고
+    있었고, **진입점이 없어 아무 일도 하지 않고 조용히 성공한 것처럼 끝났다.**
+    돌렸다고 믿고 재수집까지 했다가 컬럼이 없어 실패하는 게 최악이라 만든다.
+    """
+    import os
+
+    import psycopg                                            # 지연 import
+
+    dsn = os.environ.get("DIVDESK_DSN",
+                         "postgresql://divdesk@localhost:5432/divdesk")
+    with psycopg.connect(dsn) as conn:
+        result = run(conn)
+
+    print(f"스키마 {result['applied']}건 적용 / 실패 {len(result['failed'])}건")
+    for name, reason in result["failed"]:
+        print(f"  ✗ {name}: {reason}")
+    return 1 if result["failed"] else 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

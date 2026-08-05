@@ -1,7 +1,7 @@
 {
   "app_name": "DivDesk (배당ETF 매수검토기)",
-  "saved_at": "2026-08-01 (2차 과제까지 완료)",
-  "current_stage": "전 기능 구현 완료 — 배포 및 운용사 공시 대조만 남음",
+  "saved_at": "2026-08-05 (HANDOFF 1·2·4순위 코드 작업 완료)",
+  "current_stage": "전 기능 구현 완료 — 1순위 open/low 흐름·migrate 진입점 수정 완료, EC2에서 make migrate + make collect + diagnose_prices 실행 남음",
   "tech_stack": [
     "React",
     "Vite",

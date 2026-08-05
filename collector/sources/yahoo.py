@@ -68,26 +68,40 @@ class YahooAdapter(Adapter):
         return sorted(out, key=lambda d: d.ex_date)
 
     def fetch_history(self, ticker: str, rng: str = "2y") -> list[tuple]:
-        """(날짜, 종가, 수정종가) 시계열.
+        """(날짜, 종가, 수정종가, 시가, 저가) 시계열.
 
         수정종가(adjclose)는 분배금을 재투자한 것으로 보정한 값이라
         두 시점의 비율이 곧 총수익률이 된다. 종가만으로 계산하면
         분배금 재투자를 무시한 근사치가 되므로 함께 받는다.
+
+        시가·저가를 함께 돌려주는 이유: `engine/exdrop.py` 의 배당락 낙폭은
+        **시가** 로 잰다(배당락은 개장 시점에 반영되고 그 뒤는 일반 매매다).
+        예전에는 이 함수가 3튜플만 돌려줘 `store.pad()` 가 시가·저가를 항상
+        None 으로 채웠고, 그 결과 스키마에 컬럼을 추가하고 재수집해도
+        배당락 회복력 10점이 영구히 중립으로 남았다. 응답에는 처음부터
+        들어 있던 값이라 추가 요청 없이 그대로 꺼내 쓴다.
         """
         res = self._chart(ticker, rng, events="div")
         check_contract(res, ["timestamp", "indicators"], "yahoo.history")
         stamps = res["timestamp"]
         quotes = res["indicators"]["quote"][0]
         closes = quotes.get("close") or []
+        opens = quotes.get("open") or []
+        lows = quotes.get("low") or []
         adj_block = (res["indicators"].get("adjclose") or [{}])[0]
         adjs = adj_block.get("adjclose") or []
+
+        def at(seq: list, idx: int):
+            """없는 값은 None 으로 둔다. 시가가 비면 그 배당락 표본만 빠진다."""
+            value = seq[idx] if idx < len(seq) else None
+            return float(value) if value is not None else None
+
         out = []
         for idx, (ts, close) in enumerate(zip(stamps, closes)):
             if close is None:
                 continue                      # 거래정지일 등. 채워 넣지 않는다.
-            adj = adjs[idx] if idx < len(adjs) else None
-            out.append((_to_date(int(ts)), float(close),
-                        float(adj) if adj is not None else None))
+            out.append((_to_date(int(ts)), float(close), at(adjs, idx),
+                        at(opens, idx), at(lows, idx)))
         return out
 
     def fetch_usdkrw(self) -> tuple[float, "object"]:
